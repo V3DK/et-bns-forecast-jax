@@ -20,7 +20,7 @@ import numpy as np
 
 RUNS_DIR = Path(__file__).resolve().parent / "runs"
 
-PACKAGES = ["jimgw", "jax", "jaxlib", "blackjax", "ripplegw", "bilby", "lalsuite", "anesthetic", "numpy"]
+PACKAGES = ["jimgw", "jax", "jaxlib", "blackjax", "ripplegw", "bilby", "lalsuite", "astropy", "anesthetic", "numpy"]
 
 
 def _jsonable(x):
