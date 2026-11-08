@@ -1,9 +1,37 @@
-""" fast inference on a single injected event: intrinsic-only (M_c, q, Lambda_1, Lambda_2) """
-import os
+""" SwiG inference on a single injected event: intrinsic-only (M_c, q, Lambda_1, Lambda_2) or all parameters
 
-# Expose every CPU core as a JAX device; must happen before jax is imported.
-N_DEVICES = 4  # set to your performance-core count (`sysctl -n hw.perflevel0.physicalcpu`)
-os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={N_DEVICES}"
+Default: CPU on a Mac, one forced JAX host device per performance core.
+  Mac:  python swig.py                       (override core count with N_DEVICES=k)
+  GPU:  REQUIRE_GPU=1 python swig.py         (N_DEVICES = number of visible GPUs)
+"""
+import os
+import subprocess
+
+# True: sample only (M_c, q, Lambda_1, Lambda_2), holding spins + extrinsics at injected values.
+# False: sample all parameters.
+INTRINSIC_ONLY = False
+
+# Backend selection; must happen before jax is imported.
+USE_GPU = os.environ.get("REQUIRE_GPU", "0") not in ("", "0")
+
+
+def _perf_cores():
+    """Mac performance-core count; efficiency cores straggle and stall synchronised steps."""
+    try:
+        return int(subprocess.run(["sysctl", "-n", "hw.perflevel0.physicalcpu"],
+                                  capture_output=True, text=True, check=True).stdout)
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        return os.cpu_count() or 4
+
+
+if USE_GPU:
+    os.environ.setdefault("JAX_PLATFORMS", "cuda")   # fail loudly instead of falling back to CPU
+else:
+    os.environ["JAX_PLATFORMS"] = "cpu"              # also sidesteps jax-metal (no float64)
+    _n_host = int(os.environ.get("N_DEVICES") or _perf_cores())
+    os.environ["XLA_FLAGS"] = (os.environ.get("XLA_FLAGS", "") +
+        f" --xla_force_host_platform_device_count={_n_host}")
+
 
 import time
 from datetime import datetime
@@ -14,29 +42,42 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
+jax.config.update("jax_enable_x64", True)
+
+_expected = "gpu" if USE_GPU else "cpu"
+if jax.default_backend() != _expected:
+    raise RuntimeError(f"expected {_expected} backend, got {jax.devices()}")
+N_DEVICES = jax.local_device_count()   # GPUs on a GPU node, forced host devices on a Mac
+print(f"backend={jax.default_backend()}, devices={jax.devices()}")
+
 import bilby
 import bilby.gw.conversion as conv
 from bilby.gw.conversion import lambda_from_mass_and_family
 from bilby.gw.cosmology import get_cosmology
 
+import lal
 import lalsimulation as lalsim
 
-jax.config.update("jax_enable_x64", True)
 
 from jimgw.core.jim import Jim
-from jimgw.core.prior import CombinePrior, UniformPrior
+from jimgw.core.prior import (
+    CombinePrior,
+    UniformPrior,
+    CosinePrior,
+    SinePrior,
+    PowerLawPrior
+)
 from jimgw.core.single_event.detector import get_ET
 from jimgw.core.single_event.likelihood import HeterodynedTransientLikelihoodFD, TransientLikelihoodFD
 from jimgw.core.single_event.waveform import RippleIMRPhenomD_NRTidalv2
 from jimgw.core.single_event.transforms import MassRatioToSymmetricMassRatioTransform
-from jimgw.samplers.config import BlackJAXNSSConfig
+from jimgw.samplers.config import BlackJAXSwiGConfig
 
 from run_io import describe_prior, prior_space_truths, save_config, save_results
 
-RUN_NAME = f"injection_fast_{datetime.now():%Y%m%d_%H%M%S}"
+RUN_NAME = f"{'4p' if INTRINSIC_ONLY else '12p'}_{os.environ.get('SLURM_JOB_ID', f'{datetime.now():%Y%m%d_%H%M%S}')}"
 OUT = Path(__file__).resolve().parent / "runs" / RUN_NAME
-OUT.mkdir(parents=True, exist_ok=False)   # fail rather than overwrite
-
+OUT.mkdir(parents=True, exist_ok=True)
 
 print(f"JAX devices: {len(jax.devices())}")
 
@@ -59,14 +100,14 @@ def merger_cutoff_frequency(waveform, params, f_lo, f_hi, threshold, n=20000):
 waveform = RippleIMRPhenomD_NRTidalv2(f_ref=20)
 gps = 1126259462.4
 SKY_SEED, NOISE_SEED, SAMPLER_SEED = 0, 1, 2
-random_samples = jax.random.uniform(jax.random.key(SKY_SEED), (3,), maxval=jnp.pi)
+random_samples = jax.random.uniform(jax.random.key(SKY_SEED), (3,))
 noise_key = jax.random.key(NOISE_SEED)
 
 EOS = "MPA1"
 fam = lalsim.CreateSimNeutronStarFamily(lalsim.SimNeutronStarEOSByName(EOS))
 
-COSMOLOGY = "Planck15"
-d_L = 500.0
+COSMOLOGY = "Planck18"
+d_L = 500.0 # Mpc
 z = float(conv.luminosity_distance_to_redshift(d_L, cosmology=get_cosmology(COSMOLOGY)))
 
 # m1 must be heavier to respect q setup
@@ -83,26 +124,39 @@ injection_parameters = {
     "lambda_2": lambda_from_mass_and_family(m2_src, fam),
     "iota": 0.5,
     "d_L": d_L,
-    "ra": random_samples[0] * 2.0,
-    "dec": random_samples[1] - jnp.pi / 2,
-    "psi": random_samples[2],
+    "ra": random_samples[0] * 2 * jnp.pi,
+    "dec": jnp.arcsin(2 * random_samples[1] - 1),  # isotropic: uniform in sin(dec)
+    "psi": random_samples[2] * jnp.pi,
     "t_c": 0.0,
     "phase_c": 0.0,
 }
 injection_parameters = {k: float(v) for k, v in injection_parameters.items()}
 
-# Held at injected values: extrinsics + spins. phase_c stays marginalised.
-FIXED = ["s1_z", "s2_z", "iota", "d_L", "ra", "dec", "psi", "t_c"]
+# Held at injected values when INTRINSIC_ONLY: extrinsics + spins. phase_c stays marginalised.
+FIXED = ["s1_z", "s2_z", "iota", "d_L", "ra", "dec", "psi", "t_c"] if INTRINSIC_ONLY else []
 fixed_parameters = {k: injection_parameters[k] for k in FIXED}
 
-f_min = 20.0 
+# setup for M_c prior -> search in real PE returns a chirp mass estimate
+Mc = injection_parameters["M_c"]
+half_width = 0.01 * Mc
+
+f_min = 5.0
 f_max =  2000.0
-duration = 256.0
 sampling_frequency = 4096.0
+
+# duration must hold the longest template in the prior from f_min to merger, else the early
+# inspiral wraps around. Longest = lowest M_c, equal masses, max prior spin (conservative bound).
+POST_TRIGGER = 2.0   # inject_signal puts 2 s of data after the trigger
+SAFETY = 1.1
+Mc_lo = Mc - half_width
+m_eq = Mc_lo * 2 ** 0.2 * lal.MSUN_SI # approximate as equal mass
+chirp_time = lalsim.SimInspiralChirpTimeBound(f_min, m_eq, m_eq, 0.05, 0.05)
+duration = float(2 ** np.ceil(np.log2(SAFETY * chirp_time + POST_TRIGGER)))
+print(f"chirp time from {f_min:g} Hz: {chirp_time:.0f} s -> duration {duration:.0f} s")
 
 ifos = get_ET()
 et_psd = Path(bilby.__file__).parent / "gw/detector/noise_curves/ET_D_psd.txt"
-for ifo in ifos:
+for ifo, key in zip(ifos, jax.random.split(noise_key, len(ifos))):   # independent noise per ifo
     ifo.load_and_set_psd(psd_file=str(et_psd))
     ifo.inject_signal(
         duration=duration,
@@ -113,7 +167,7 @@ for ifo in ifos:
         f_min=f_min,
         f_max=f_max,
         zero_noise=False,
-        rng_key=noise_key,
+        rng_key=key,
     )
 
 # likelihood band stops just before the reference waveform's merger taper (see merger_cutoff_frequency);
@@ -122,18 +176,23 @@ CUTOFF_THRESHOLD = 0.2
 f_max_likelihood = min(f_max, merger_cutoff_frequency(waveform, injection_parameters, f_min, f_max, CUTOFF_THRESHOLD))
 print(f"likelihood f_max: {f_max_likelihood:.0f} Hz")
 
-# setup for M_c prior -> search in real PE returns a chirp mass estimate
-Mc = injection_parameters["M_c"]
-half_width = 0.01 * Mc
-
-prior = CombinePrior(
-    [
-        UniformPrior(Mc - half_width, Mc + half_width, parameter_names=["M_c"]),
-        UniformPrior(0.5, 1.0, parameter_names=["q"]),
-        UniformPrior(0.0, 5000.0, parameter_names=["lambda_1"]),
-        UniformPrior(0.0, 5000.0, parameter_names=["lambda_2"]),
-    ]
-)
+intrinsic_priors = [
+    UniformPrior(Mc - half_width, Mc + half_width, parameter_names=["M_c"]),
+    UniformPrior(0.5, 1.0, parameter_names=["q"]),
+    UniformPrior(0.0, 5000.0, parameter_names=["lambda_1"]),
+    UniformPrior(0.0, 5000.0, parameter_names=["lambda_2"]),
+]
+other_priors = [
+    UniformPrior(-0.05, 0.05, parameter_names=["s1_z"]),
+    UniformPrior(-0.05, 0.05, parameter_names=["s2_z"]),
+    SinePrior(parameter_names=["iota"]),
+    PowerLawPrior(10.0, 2000.0, 2.0, parameter_names=["d_L"]),
+    UniformPrior(-0.1, 0.1, parameter_names=["t_c"]),
+    UniformPrior(0.0, 2 * jnp.pi, parameter_names=["ra"]),
+    CosinePrior(parameter_names=["dec"]),
+    UniformPrior(0.0, jnp.pi, parameter_names=["psi"]),
+]
+prior = CombinePrior(intrinsic_priors if INTRINSIC_ONLY else intrinsic_priors + other_priors)
 
 # maps from prior space to likelihood space (don't need to be invertible)
 likelihood_transforms = [MassRatioToSymmetricMassRatioTransform]
@@ -153,11 +212,31 @@ likelihood = HeterodynedTransientLikelihoodFD(
     phase_marginalization=phase_marginalization,
 )
 
-sampler_config = BlackJAXNSSConfig(
-    n_live=2 * N_DEVICES * round(1000 / (2 * N_DEVICES)),  # n_live, n_delete divisible by N_DEVICES
+if INTRINSIC_ONLY:
+    # only this one block because 4 param
+    blocks = [["M_c", "q", "lambda_1", "lambda_2"]]
+else:
+    blocks = [
+        ["M_c", "q", "lambda_1", "lambda_2"],
+        ["s1_z", "s2_z"],
+        ["iota", "d_L"],
+        ["ra", "dec", "psi"],
+        ["t_c"],
+    ]
+
+# n_live rounded to a multiple of 4*N_DEVICES so n_live and n_delete are divisible by N_DEVICES.
+# Check the printed value matches across machines: it depends on N_DEVICES.
+N_LIVE = int(os.environ.get("N_LIVE", 1024))
+n_live = 4 * N_DEVICES * max(1, round(N_LIVE / (4 * N_DEVICES)))
+print(f"n_live = {n_live} (requested {N_LIVE}, N_DEVICES = {N_DEVICES})")
+
+sampler_config = BlackJAXSwiGConfig(
+    blocks=blocks,
+    n_live=n_live,
     n_delete_frac=0.5,
-    num_inner_steps_per_dim=10,
-    termination_dlogz=0.1,
+    num_inner_steps_per_dim=5, # try 3 as well
+    termination_dlogz=0.5, # used to be 0.1
+    num_gibbs_sweeps=1,
     n_devices=N_DEVICES,
     checkpoint_dir=str(OUT / "ckpt"),
     checkpoint_interval=120,
@@ -190,6 +269,7 @@ parameter_labels = {
 }
 
 save_config(OUT, __file__, {
+    "intrinsic_only": INTRINSIC_ONLY,
     "injection": {
         "eos": EOS,
         "m1_src": m1_src,
@@ -236,20 +316,36 @@ save_config(OUT, __file__, {
     },
 })
 
-# estimate single eval time 
-
-x = jim.prior.sample(jax.random.key(42), 1000)
-x = jnp.stack([x[k] for k in jim.prior.parameter_names]).T
+# throughput vs batch size; us_per_eval taken at the sampler's deletion batch (n_delete)
+n_delete = int(sampler_config.n_live * sampler_config.n_delete_frac)
 f = jax.jit(jax.vmap(jim.evaluate_posterior))
-f(x).block_until_ready()                      # compile
-t = time.time(); f(x).block_until_ready()
-us_per_eval = (time.time() - t) / 1000 * 1e6
-print(f"{us_per_eval:.1f} µs per eval")
+timings = {}
+for B in sorted({256, 1024, 4096, 16384, n_delete, sampler_config.n_live}):
+    x = jim.prior.sample(jax.random.key(42), B)
+    x = jnp.stack([x[k] for k in jim.prior.parameter_names]).T
+    f(x).block_until_ready()
+    t = time.perf_counter(); f(x).block_until_ready()
+    timings[B] = time.perf_counter() - t
+    print(f"{B:6d}  {timings[B]*1e3:8.2f} ms/batch  {timings[B]/B*1e6:7.2f} µs/eval")
+us_per_eval = timings[n_delete] / n_delete * 1e6
 
-
+# sample
 start_time = time.time()
 jim.sample()
 sampling_time = time.time() - start_time
+
+# save immediately to be safe
+base = {
+    "us_per_posterior_eval": us_per_eval,
+    "ms_per_batch": {str(B): t * 1e3 for B, t in timings.items()},
+    "sampling_time_s": sampling_time,
+}
+chains = save_results(OUT, jim, base)
+
+# jimgw deletes ckpt/jax_cache on completion, but JAX has already latched the
+# persistent cache as enabled; reset it so later jits don't try to write there
+from jax._src import compilation_cache
+compilation_cache.reset_cache()
 print(f"Sampling took {sampling_time / 60:.2f} mins")
 
 
@@ -287,7 +383,11 @@ if max_dlogl > CHECK_TOL:
     print(f"WARNING: heterodyne disagrees with exact likelihood by {max_dlogl:.3g} > {CHECK_TOL}; posterior unreliable")
 
 chains = save_results(OUT, jim, {
+    "n_live": sampler_config.n_live,
+    "n_delete": n_delete,
     "us_per_posterior_eval": us_per_eval,
+    "ms_per_batch": {str(B): t * 1e3 for B, t in timings.items()},
+    "sampling_time_s": sampling_time,
     "check_max_abs_dlogl_het_vs_exact": max_dlogl,
     "check_n_samples": len(idx),
     "check_passed": max_dlogl <= CHECK_TOL,
