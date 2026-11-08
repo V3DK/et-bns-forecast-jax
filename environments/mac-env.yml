@@ -1,0 +1,89 @@
+name: neutron-jax
+channels:
+  - conda-forge
+dependencies:
+  # --- interpreter + JAX (CPU build forced; see note) ---
+  - python=3.12.12
+  - jax=0.9.0
+  - jaxlib=0.9.0=*cpu*
+
+  # --- conda leaves from the Mac env (jupyter dropped) ---
+  - bilby=2.7.0
+  - blackjax=1.7.1
+  - python-lalsimulation=6.2.0
+  - dqsegdb2=1.3.0
+  - gwdatafind=2.1.0
+  - gwosc=0.8.1
+  - ligotimegps=2.1.0
+  - h5netcdf=1.7.3
+  - dateparser=1.2.2
+
+  # --- numerically relevant non-leaves, pinned to Mac versions ---
+  - numpy=2.3.4
+  - scipy=1.18.0
+  - python-lal=7.7.0
+  - bilby.cython=0.5.3
+  - dynesty=3.0.0
+  - emcee=3.1.6
+  - optax=0.2.8
+  - chex=0.1.92
+  - astropy-base=7.1.1
+  - h5py=3.15.1
+  - pandas=2.3.3
+  - matplotlib-base=3.10.7
+  - corner=2.2.3
+  - arviz=1.3.0
+  - xarray=2025.10.1
+
+  - pip=25.2
+  - pip:
+      - aiofiles==25.1.0
+      - anesthetic==2.16.0
+      - annotated-doc==0.0.5
+      - annotated-types==0.8.0
+      - beartype==0.23.1
+      - dataclasses-json==0.6.7
+      - diffrax==0.7.2
+      - dotmap==1.3.30
+      - equinox==0.13.8
+      - evosax==0.3.2
+      - flax==0.12.6
+      - flowmc==0.6.4
+      - fsspec==2026.9.0
+      - gwbench==0.8.9
+      - gwpy==4.1.0
+      - humanize==4.16.0
+      - importlib-resources==7.1.0
+      - iniconfig==2.3.0
+      - jaxtyping==0.3.11
+      - jimgw==0.5.2
+      - joblib==1.5.3
+      - lineax==0.1.0
+      - markdown-it-py==4.2.0
+      - marshmallow==3.26.2
+      - mdurl==0.1.2
+      - msgpack==1.2.3
+      - mypy-extensions==1.1.0
+      - nestle==0.2.1
+      - numdifftools==0.9.42
+      - optimistix==0.1.0
+      - orbax-checkpoint==0.12.7
+      - orbax-export==0.0.8
+      - pluggy==1.6.0
+      - protobuf==7.36.2
+      - pydantic==2.14.1
+      - pydantic-core==2.50.1
+      - pytest==9.0.3
+      - rich==15.0.0
+      - ripplegw==0.4.1
+      - shellingham==1.5.4
+      - simplejson==4.2.0
+      - sympy==1.14.0
+      - tensorstore==0.1.85
+      - tomli-w==1.2.0
+      - treescope==0.1.10
+      - typer==0.27.3
+      - typing-inspect==0.9.0
+      - typing-inspection==0.4.4
+      - uvloop==0.23.0
+      - wadler-lindig==0.1.7
