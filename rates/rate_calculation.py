@@ -1,13 +1,8 @@
-"""
-ET-D (ETS) BNS detection rates with gwfast:
-  (1) inspiral    : TaylorF2_RestrictedPN, 1.4+1.4 Msun, fmin = 5 Hz
-  (2) post-merger : PM_MPA1, Galactic-DNS M_tot population, fmin scanned 100 -> 1000 Hz
-Both share cosmology, merger-rate model, z grid (to z=10) and extrinsic draws.
-"""
 import os, copy
 import numpy as np
 import jax
 import astropy.units as u
+import astropy.constants as const
 from astropy.cosmology import Planck18 as COSMO
 
 import scipy.integrate as igt
@@ -16,9 +11,14 @@ if not hasattr(igt, 'cumtrapz'):
 if not hasattr(igt, 'simps'):
     igt.simps = igt.simpson
 from scipy.integrate import simpson
+from scipy.interpolate import CubicSpline
+
+import lal
+import lalsimulation as lalsim
+from bilby.gw.conversion import lambda_from_mass_and_family
 
 import gwfast.gwfastGlobals as glob
-from gwfast.waveforms import TaylorF2_RestrictedPN
+from gwfast.waveforms import TaylorF2_RestrictedPN, IMRPhenomD_NRTidalv2
 from gwfast.signal import GWSignal
 from gwfast.network import DetNet
 from pm_gwfast import PM_MPA1
@@ -26,13 +26,14 @@ from pm_gwfast import PM_MPA1
 jax.config.update("jax_enable_x64", True)
 
 # ---------------------------------------------------------------- config
-RHO_TH_INSP = 8.0
-RHO_TH_PM = 5.0
+RHO_TH_INSP = 12.0 # network SNR >= 12 used in arXiv:2303.15923, 
+RHO_TH_PM = 8.0 # a lower SNR of 8 justifiable when counterpart exists (see arXiv:2303.15923, Section 4 intro)
 
 NZ, NS = 60, 5000
-NZ_PM, Z_MAX_PM = 60, 0.5
-SEED   = 10
 Z_MAX  = 10.0
+NZ_PM, Z_MAX_PM = 60, 0.5
+
+SEED   = 10
 RES = 1000
 
 # inspiral
@@ -40,22 +41,69 @@ FMIN_INSP  = 5.0                # Hz
 BATCH_INSP = 20_000
 
 # post-merger
-FMIN_PM = 300 # Hz
+FMIN_PM = 300 # Hz, checked that 100-500 makes no difference
 BATCH_PM = 5_000
-M_LO, M_HI = 2.0, 3.2           # calibrated range of the PM fits (source-frame M_tot)
-M_THR      = 3.2                # MPA1 prompt-collapse threshold, guess / approximate (see: https://arxiv.org/abs/1307.5191)
-T_OBS, DUTY, Z_REF = 1.0, 1.0, 0.0
+M_LO, M_HI = 2.0, 4.0           # calibrated range of the PM fits (source-frame M_tot)
+T_OBS, DUTY, Z_REF = 1.0, 1.0, 0.0 # T_OBS 1 year
 
-# 90% credible interval on BNS R0, https://arxiv.org/abs/2508.18083
-R0_min, R0_max = 7.6, 250.0     # Gpc^-3 yr^-1
-# R0_min, R0_max = 13.0, 170.0     # Gpc^-3 yr^-1
+# prompt collapse threshold
+# see Koeppel 2019 (arXiv:1901.09977) for M_tov, R_tov -> M_thr
+# see Fan 24 (arXiv:2309.12644) for 68.3% interval on M_tov
+Z90 = 1.6449 # widen to 90% (assumes gaussian)
+M_TOV_0, M_TOV_ERR = 2.25, (0.07, 0.08)     # Msun, (minus, plus), 68.3%
+R_TOV_0, R_TOV_ERR = 11.90, (0.60, 0.63)    # km,   (minus, plus), 68.3%
+K_B, K_C  = 1.01, 1.34
+K_A       = 2.0 * K_B / (2.0 - K_C)
+GM_SUN_KM = (const.G * const.M_sun / const.c**2).to_value(u.km) 
+ 
+def m_thr_koeppel(M_tov, R_tov):
+    C = GM_SUN_KM * M_tov / R_tov
+    return (K_A - K_B / (1.0 - K_C * C)) * M_tov
+
+_M = (M_TOV_0 - Z90 * M_TOV_ERR[0], M_TOV_0 + Z90 * M_TOV_ERR[1])
+_R = (R_TOV_0 - Z90 * R_TOV_ERR[0], R_TOV_0 + Z90 * R_TOV_ERR[1])
+M_THR_MIN = m_thr_koeppel(_M[0], _R[0])
+M_THR_MAX = m_thr_koeppel(_M[1], _R[1])
+_corners  = [m_thr_koeppel(m, r) for m in _M for r in _R]
+assert np.isclose(min(_corners), M_THR_MIN) and np.isclose(max(_corners), M_THR_MAX), \
+    "M_thr not monotonic over the box; like-sign corners do not bound it"
+
+# 90% credible interval on BNS R0 (https://iopscience.iop.org/article/10.3847/2041-8213/ae771e)
+R0_min, R0_max = 8.8, 250.0     # Gpc^-3 yr^-1
 
 # DTD: P(t_d) ∝ t_d^-ALPHA on [T_D_MIN, T_D_MAX]
 T_D_MIN, T_D_MAX, ALPHA = 0.02, COSMO.age(0).to_value(u.Gyr), 1.0
-Z_FORM_MAX, NTD = 15.0, 10
+Z_FORM_MAX = 15.0
+NTD = 128 # checked that above 128 resolution stops changing anything
 
 PSD = os.path.join(glob.detPath, 'ET-0000A-18.txt')   # ET-D, ASD
 ETS = copy.deepcopy(glob.detectors['ETS'])
+
+EOS = "MPA1"
+_fam = lalsim.CreateSimNeutronStarFamily(lalsim.SimNeutronStarEOSByName(EOS))
+M_MAX_EOS = lalsim.SimNeutronStarMaximumMass(_fam) / lal.MSUN_SI
+M_MIN_EOS = lalsim.SimNeutronStarFamMinimumMass(_fam) / lal.MSUN_SI
+
+M_NS_LO, M_NS_HI = 0.8, 2.0     # support of the Farrow mass model (see sample_m1m2)
+assert M_MIN_EOS <= M_NS_LO and M_NS_HI < M_MAX_EOS, \
+    f"{EOS} family [{M_MIN_EOS:.3f}, {M_MAX_EOS:.3f}] does not cover [{M_NS_LO}, {M_NS_HI}]"
+
+_m_tab   = np.linspace(M_NS_LO, M_NS_HI, 601)
+_lam_tab = np.array([lambda_from_mass_and_family(m, _fam) for m in _m_tab])
+_logLam  = CubicSpline(_m_tab, np.log(_lam_tab))
+
+def Lambda_MPA1(m_src):
+    m_src = np.asarray(m_src, float)
+    if m_src.min() < M_NS_LO or m_src.max() > M_NS_HI:
+        raise ValueError("source-frame mass outside tabulated Lambda range")
+    return np.exp(_logLam(m_src))
+
+# spline accuracy check at midpoints
+_mid = 0.5 * (_m_tab[1:] + _m_tab[:-1])[::50]
+_err = np.max(np.abs(Lambda_MPA1(_mid) / np.array([lambda_from_mass_and_family(m, _fam) for m in _mid]) - 1))
+print(f"{EOS}: M_max = {M_MAX_EOS:.3f} Msun, Lambda(1.4) = {Lambda_MPA1(1.4):.1f}, "
+      f"spline rel. err = {_err:.1e}")
+
 
 # ---------------------------------------------------------------- cosmology
 def dVc_dz(z):
@@ -80,34 +128,63 @@ DTD_NORM = (np.log(T_D_MAX / T_D_MIN) if np.isclose(ALPHA, 1.0)
 P_dtd = lambda td: td**(-ALPHA) / DTD_NORM
 
 def rate_dtd(z):
-    """R(z) = ∫ psi(z_f(z, t_d)) P(t_d) dt_d, t_d ∈ [T_D_MIN, min(T_D_MAX, t_L(Z_FORM_MAX) - t_L(z))]."""
-    out = []
-    for zi in np.atleast_1d(z):
-        tLz, tcap = t_L(zi), min(T_D_MAX, T_FORM_MAX - t_L(zi))
-        if tcap <= T_D_MIN:
-            out.append(0.0); continue
-        td = np.geomspace(T_D_MIN, tcap, NTD)
-        out.append(simpson(psi_MF17(z_of_tL(tLz + td)) * P_dtd(td), x=td))
-    return np.array(out)
+    z    = np.atleast_1d(np.asarray(z, float))
+    tLz  = t_L(z)
+    tcap = np.minimum(T_D_MAX, T_FORM_MAX - tLz)
+    ok   = tcap > T_D_MIN
+    out  = np.zeros_like(z)
+    if not ok.any():
+        return out
+    # u = ln t_d, uniform on [ln T_D_MIN, ln tcap(z)] for each z
+    s  = np.linspace(0.0, 1.0, NTD)                      # (NTD,)
+    lu = np.log(T_D_MIN) + s[None, :] * np.log(tcap[ok] / T_D_MIN)[:, None]  # (Nz, NTD)
+    td = np.exp(lu)
+    f  = psi_MF17(z_of_tL(tLz[ok, None] + td)) * P_dtd(td) * td
+    out[ok] = simpson(f, x=lu, axis=1)
+    return out
 
 def merger_rate_density(z, R0=1.0, z_ref=0.0):
-    return R0 * rate_dtd(z) / rate_dtd(z_ref)[0]
+    return R0 * rate_dtd(z) / rate_dtd(z_ref)[0] # scale rate to R0 local value we have
 
-# ---------------------------------------------------------------- PM mass population
-def sample_mtot(rng, n, m_lo=1.0, m_hi=2.5): # see mass model from https://arxiv.org/abs/2508.18083
-    m1 = rng.uniform(m_lo, m_hi, n)
-    m2 = rng.uniform(m_lo, m_hi, n)
-    return m1 + m2
+
+# ---------------------------------------------------------------- mass population
+def _trunc_normal(rng, mu, sigma, n, lo, hi):
+    """Normal(mu, sigma) truncated to [lo, hi] via resampling."""
+    out = rng.normal(mu, sigma, n)
+    bad = (out < lo) | (out > hi)
+    while bad.any():
+        out[bad] = rng.normal(mu, sigma, bad.sum())
+        bad = (out < lo) | (out > hi)
+    return out
+
+def sample_m1m2(rng, n,
+                mu1=1.34, sigma1=0.02, mu2=1.47, sigma2=0.15, alpha=0.68,
+                ms_lo=1.16, ms_hi=1.42, m_min=0.8, m_max=2.0):
+    # Galactic DNS mass model: Farrow 2019, https://arxiv.org/abs/1902.03300
+    first = rng.random(n) < alpha
+    m_r = np.where(first,
+                   _trunc_normal(rng, mu1, sigma1, n, m_min, m_max),
+                   _trunc_normal(rng, mu2, sigma2, n, m_min, m_max))
+    # Slow NS: uniform.
+    m_s = rng.uniform(ms_lo, ms_hi, n)
+    return np.maximum(m_r, m_s), np.minimum(m_r, m_s)
 
 # ---------------------------------------------------------------- catalogue (shared extrinsics)
 rng = np.random.default_rng(SEED)
-eta = 0.25                                       # both models equal-mass
 
-def make_base(zg, ns):
-    n  = len(zg) * ns
-    dL = COSMO.luminosity_distance(zg).to_value(u.Gpc)
-    return np.repeat(zg, ns), dict(
-        eta     = np.full(n, eta),
+def make_catalogue(zg, ns):
+    """Population masses + isotropic extrinsics on a z grid (ns draws per z node)."""
+    n   = len(zg) * ns
+    z   = np.repeat(zg, ns)
+    dL  = COSMO.luminosity_distance(zg).to_value(u.Gpc)
+    m1, m2 = sample_m1m2(rng, n)
+    Mt  = m1 + m2
+    eta = m1 * m2 / Mt**2
+    ev = dict(
+        Mc      = Mt * eta**0.6 * (1.0 + z),     # detector frame
+        eta     = eta,
+        Lambda1 = Lambda_MPA1(m1),               # source-frame masses; Lambda1 <-> heavier
+        Lambda2 = Lambda_MPA1(m2),
         dL      = np.repeat(dL, ns),
         theta   = np.arccos(rng.uniform(-1, 1, n)),
         phi     = rng.uniform(0, 2 * np.pi, n),
@@ -116,21 +193,24 @@ def make_base(zg, ns):
         tcoal   = np.zeros(n), Phicoal = np.zeros(n),
         chi1z   = np.zeros(n), chi2z   = np.zeros(n),
     )
+    return z, ev, m1, m2
 
 # inspiral: fixed 1.4 + 1.4, full grid
 z_grid       = np.geomspace(1e-3, Z_MAX, NZ)
-z_i, base_i  = make_base(z_grid, NS)
-M_INSP       = 2.8
-ev_insp      = dict(base_i, Mc=M_INSP * eta**0.6 * (1.0 + z_i))
+z_i, ev_insp, m1_i, m2_i = make_catalogue(z_grid, NS)
 
-# post-merger: dedicated low-z grid
-z_grid_pm    = np.geomspace(1e-3, Z_MAX_PM, NZ_PM)
-z_p, base_p  = make_base(z_grid_pm, NS)
-Mt     = sample_mtot(rng, len(z_p))
-ev_pm  = dict(base_p, Mc=Mt * eta**0.6 * (1.0 + z_p))
-has_PM = Mt < M_THR
+# post-merger: dedicated low-z grid (PM model doesn't have lambdas)
+z_grid_pm    = np.geomspace(1e-3, Z_MAX_PM, NZ_PM) # checked that P_det -> 0 around Z_MAX_PM
+z_p, ev_pm, m1_p, m2_p = make_catalogue(z_grid_pm, NS)
+ev_pm = {k: v for k, v in ev_pm.items() if k not in ('Lambda1', 'Lambda2')}
+Mt = m1_p + m2_p
+
+has_PM_lo = Mt < M_THR_MIN      
+has_PM_hi = Mt < M_THR_MAX      
 in_cal = (Mt >= M_LO) & (Mt <= M_HI)
-print(f"f_PM = {has_PM.mean():.3f}   outside calibration = {(~in_cal).mean():.3f}")
+print(f"M_thr in [{M_THR_MIN:.3f}, {M_THR_MAX:.3f}] Msun   "
+      f"f_PM in [{has_PM_lo.mean():.3f}, {has_PM_hi.mean():.3f}]   "
+      f"outside calibration = {(~in_cal).mean():.3f}   max(Mt) = {Mt.max():.3f}")
 
 # ---------------------------------------------------------------- intrinsic rate integral
 z_f     = np.geomspace(z_grid[0], z_grid[-1], 4000)
@@ -167,62 +247,45 @@ def row(fmin, N_hat):
             f"{R0_min*N_hat:12.3g} – {R0_max*N_hat:.3g}")
 
 # ---------------------------------------------------------------- (1) inspiral
-print("\n[inspiral]  TaylorF2, 1.4+1.4")
+net_insp = make_net(IMRPhenomD_NRTidalv2(), FMIN_INSP)
 print(HDR)
-snr_i = compute_snr(make_net(TaylorF2_RestrictedPN(), FMIN_INSP), ev_insp, BATCH_INSP)
+snr_i = compute_snr(net_insp, ev_insp, BATCH_INSP)
 P, err, N_hat = rate_from_det(snr_i >= RHO_TH_INSP, z_grid)
-# np.savez(f'pdet_ETS_insp_fmin{FMIN_INSP:g}.npz', z=z_grid, P_det=P, P_err=err,
-#          rho_th=RHO_TH, fmin=FMIN_INSP)
 print(row(FMIN_INSP, N_hat))
 
-# ---------------------------------------------------------------- (2) post-merger, fmin scan
+# ---------------------------------------------------------------- (2) post-merger
 print("\n[post-merger]  PM_MPA1")
 print(HDR)
 wf_pm   = PM_MPA1(M_lo=M_LO, M_hi=M_HI, cosmo=COSMO)
 
 snr_p = compute_snr(make_net(wf_pm, FMIN_PM), ev_pm, BATCH_PM)
 # out-of-calibration events have SNR=0 inside Ampl -> N_det is a lower bound
-P, err, N_hat = rate_from_det((snr_p >= RHO_TH_PM) & has_PM, z_grid_pm)
-# np.savez(f'pdet_ETS_PM_fmin{fmin:g}.npz', z=z_grid, P_det=P, P_err=err,
-#             rho_th=RHO_TH, fmin=fmin, snr=snr_p, Mt=Mt)
-print(row(FMIN_PM, N_hat))
+
+det_pm_lo = (snr_p >= RHO_TH_PM) & has_PM_lo
+det_pm_hi = (snr_p >= RHO_TH_PM) & has_PM_hi
+_, _, N_pm_lo = rate_from_det(det_pm_lo, z_grid_pm)
+_, _, N_pm_hi = rate_from_det(det_pm_hi, z_grid_pm)
 
 
+print(row(FMIN_PM, N_pm_lo) + f"   [M_thr = {M_THR_MIN:.3f}]")
+print(row(FMIN_PM, N_pm_hi) + f"   [M_thr = {M_THR_MAX:.3f}]")
+print(f"envelope (R0 x M_thr): {R0_min*N_pm_lo:.3g} – {R0_max*N_pm_hi:.3g} /yr   "
+      f"N(M_thr_max)/N(M_thr_min) = {N_pm_hi/N_pm_lo:.3g}")
 
-
-
-
-# ---------------------------------------------------------------- plot: cumulative detection rate vs z
-import matplotlib.pyplot as plt
-from scipy.integrate import cumulative_trapezoid
-
-def dNdz_det(det, zg):
-    """Detected dN/dz per R0 on z_f."""
-    P   = det.reshape(len(zg), NS).mean(axis=1)
-    P_f = np.interp(np.log(z_f), np.log(zg), P, right=0.0)
-    return T_OBS * DUTY * dN_intr * P_f
-
-curves = [
-    (rf'inspiral ($\rho_{{\rm th}}={RHO_TH_INSP:g}$, $f_{{\rm min}}={FMIN_INSP:g}$ Hz)',
-     dNdz_det(snr_i >= RHO_TH_INSP, z_grid), 'C0', 0.30),
-    (rf'post-merger ($\rho_{{\rm th}}={RHO_TH_PM:g}$, $f_{{\rm min}}={FMIN_PM:g}$ Hz)',
-     dNdz_det((snr_p >= RHO_TH_PM) & has_PM, z_grid_pm), 'C3', 0.30),
-]
-
-fig, ax = plt.subplots(figsize=(6, 4.2), constrained_layout=True)
-for lab, dn, c, a in curves:
-    cum    = cumulative_trapezoid(dn, z_f, initial=0.0)
-    lo, hi = R0_min * cum, R0_max * cum
-    ax.fill_between(z_f, lo, hi, color=c, alpha=a, lw=0, label=lab)
-    ax.plot(z_f, lo, color=c, lw=0.8)
-    ax.plot(z_f, hi, color=c, lw=0.8)
-    print(f"{lab:>60s}: N(<z_max) = {lo[-1]:.3g} – {hi[-1]:.3g} /yr")
-
-ax.set_xscale('log'); ax.set_yscale('log')
-ax.set_xlim(z_f[0], z_f[-1]); ax.set_ylim(bottom=1e-3)
-ax.set_xlabel(r'$z$'); ax.set_ylabel(r'$N(<z)$ [yr$^{-1}$]')
-ax.grid(which='both', alpha=0.2)
-ax.legend(fontsize=8, loc='lower right')
-ax.set_title(rf'ET-D (ETS), $R_0\in[{R0_min:g},\,{R0_max:g}]$ Gpc$^{{-3}}$ yr$^{{-1}}$ (90% CI)', fontsize=10)
-fig.savefig(f'Ncum_vs_z_ETS_PMfmin{FMIN_PM:g}.pdf')
-plt.show()
+# ---------------------------------------------------------------- save outputs
+OUT = f'ETS_rates_PMfmin{FMIN_PM:g}.npz'
+np.savez_compressed(
+    OUT,
+    # integration grid + intrinsic rate (per R0)
+    z_f=z_f, dN_intr=dN_intr, N_intr=N_intr,
+    # MC grids and raw per-event outputs
+    z_grid=z_grid, z_grid_pm=z_grid_pm, NS=NS,
+    snr_i=snr_i, snr_p=snr_p, Mt=Mt,
+    # settings needed to reproduce selections/labels
+    T_OBS=T_OBS, DUTY=DUTY,
+    RHO_TH_INSP=RHO_TH_INSP, RHO_TH_PM=RHO_TH_PM,
+    FMIN_INSP=FMIN_INSP, FMIN_PM=FMIN_PM,
+    M_THR_MIN=M_THR_MIN, M_THR_MAX=M_THR_MAX,
+    R0_min=R0_min, R0_max=R0_max,
+)
+print(f"saved -> {OUT}")
