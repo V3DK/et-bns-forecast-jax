@@ -84,9 +84,18 @@ def _cpu_model():
 
 
 def runtime_environment():
+    # env = {k: os.environ.get(k) for k in (
+    #     "SLURM_JOB_ID", "SLURM_JOB_PARTITION", "SLURM_CPUS_PER_TASK", "SLURM_JOB_NODELIST",
+    #     "N_DEVICES", "N_LIVE", "XLA_FLAGS", "OMP_NUM_THREADS", "CONDA_DEFAULT_ENV", "CUDA_VISIBLE_DEVICES")}
+    
     env = {k: os.environ.get(k) for k in (
-        "SLURM_JOB_ID", "SLURM_JOB_PARTITION", "SLURM_CPUS_PER_TASK", "SLURM_JOB_NODELIST",
-        "N_DEVICES", "N_LIVE", "XLA_FLAGS", "OMP_NUM_THREADS", "CONDA_DEFAULT_ENV", "CUDA_VISIBLE_DEVICES")}
+        "SLURM_JOB_ID", "SLURM_ARRAY_JOB_ID", "SLURM_ARRAY_TASK_ID",
+        "SLURM_JOB_PARTITION", "SLURM_CPUS_PER_TASK", "SLURM_JOB_NODELIST",
+        "N_DEVICES", "N_LIVE", "STEPS_PER_DIM", "DELETE_FRAC", "SAMPLER_SEED", "PROFILE",
+        "REQUIRE_GPU", "JAX_CACHE_DIR", "XLA_FLAGS",
+        "OMP_NUM_THREADS", "CONDA_DEFAULT_ENV", "CUDA_VISIBLE_DEVICES")}
+    
+
     env["hostname"] = platform.node()
     env["cpu_model"] = _cpu_model()
     env["cpu_count"] = os.cpu_count()

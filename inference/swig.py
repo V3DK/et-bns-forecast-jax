@@ -14,6 +14,10 @@ INTRINSIC_ONLY = False
 # Backend selection; must happen before jax is imported.
 USE_GPU = os.environ.get("REQUIRE_GPU", "0") not in ("", "0")
 
+SAMPLER_SEED  = int(os.environ.get("SAMPLER_SEED", 2))
+STEPS_PER_DIM = int(os.environ.get("STEPS_PER_DIM", 5))
+DELETE_FRAC   = float(os.environ.get("DELETE_FRAC", 0.5))
+PROFILE       = os.environ.get("PROFILE", "0") not in ("", "0")
 
 def _perf_cores():
     """Mac performance-core count; efficiency cores straggle and stall synchronised steps."""
@@ -43,6 +47,26 @@ import jax
 import jax.numpy as jnp
 
 jax.config.update("jax_enable_x64", True)
+
+import logging, re
+CACHE_DIR = os.environ.get("JAX_CACHE_DIR")
+if CACHE_DIR:
+    jax.config.update("jax_compilation_cache_dir", CACHE_DIR)
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
+
+class CompileTimer(logging.Handler):
+    """Sums tracing + lowering + XLA compile time from jax_log_compiles messages."""
+    _pat = re.compile(r"in ([0-9.]+) sec")
+    def __init__(self): super().__init__(); self.reset()
+    def reset(self): self.total, self.n = 0.0, 0
+    def emit(self, rec):
+        msg = rec.getMessage()
+        m = self._pat.search(msg)
+        if m and msg.startswith("Finished"):
+            self.total += float(m.group(1)); self.n += 1
+compile_timer = CompileTimer()
+logging.getLogger("jax").addHandler(compile_timer)
+jax.config.update("jax_log_compiles", True)
 
 _expected = "gpu" if USE_GPU else "cpu"
 if jax.default_backend() != _expected:
@@ -75,7 +99,10 @@ from jimgw.samplers.config import BlackJAXSwiGConfig
 
 from run_io import describe_prior, prior_space_truths, save_config, save_results
 
-RUN_NAME = f"{'4p' if INTRINSIC_ONLY else '12p'}_{os.environ.get('SLURM_JOB_ID', f'{datetime.now():%Y%m%d_%H%M%S}')}"
+# RUN_NAME = f"{'4p' if INTRINSIC_ONLY else '12p'}_{os.environ.get('SLURM_JOB_ID', f'{datetime.now():%Y%m%d_%H%M%S}')}"
+RUN_NAME = (f"{'4p' if INTRINSIC_ONLY else '12p'}_s{STEPS_PER_DIM}_f{DELETE_FRAC}_seed{SAMPLER_SEED}_"
+            f"{os.environ.get('SLURM_JOB_ID', f'{datetime.now():%Y%m%d_%H%M%S}')}")
+
 RUNS_ROOT = Path(os.environ.get("RUNS_DIR", Path(__file__).resolve().parent / "runs"))
 OUT = RUNS_ROOT / RUN_NAME
 OUT.mkdir(parents=True, exist_ok=True)
@@ -100,7 +127,10 @@ def merger_cutoff_frequency(waveform, params, f_lo, f_hi, threshold, n=20000):
 
 waveform = RippleIMRPhenomD_NRTidalv2(f_ref=20)
 gps = 1126259462.4
-SKY_SEED, NOISE_SEED, SAMPLER_SEED = 0, 1, 2
+# SKY_SEED, NOISE_SEED, SAMPLER_SEED = 42, 43, 44 # used to be 0, 1, 2
+
+SKY_SEED, NOISE_SEED = 0, 1          # SAMPLER_SEED now from env
+
 random_samples = jax.random.uniform(jax.random.key(SKY_SEED), (3,))
 noise_key = jax.random.key(NOISE_SEED)
 
@@ -108,12 +138,12 @@ EOS = "MPA1"
 fam = lalsim.CreateSimNeutronStarFamily(lalsim.SimNeutronStarEOSByName(EOS))
 
 COSMOLOGY = "Planck18"
-d_L = 500.0 # Mpc
+d_L = 1000.0 # Mpc, used to be 500.0
 z = float(conv.luminosity_distance_to_redshift(d_L, cosmology=get_cosmology(COSMOLOGY)))
 
 # m1 must be heavier to respect q setup
-m1_src = 1.5
-m2_src = 1.25
+m1_src = 1.6 # 1.5
+m2_src = 1.2 # 1.25
 m1_det, m2_det = (1+z) * m1_src, (1+z) * m2_src
 
 injection_parameters = {
@@ -234,14 +264,16 @@ print(f"n_live = {n_live} (requested {N_LIVE}, N_DEVICES = {N_DEVICES})")
 sampler_config = BlackJAXSwiGConfig(
     blocks=blocks,
     n_live=n_live,
-    n_delete_frac=0.5,
-    num_inner_steps_per_dim=5, # try 3 as well
+    n_delete_frac=DELETE_FRAC,
+    num_inner_steps_per_dim=STEPS_PER_DIM, 
     termination_dlogz=0.5, # used to be 0.1
     num_gibbs_sweeps=1,
     n_devices=N_DEVICES,
     checkpoint_dir=str(OUT / "ckpt"),
     checkpoint_interval=120,
 )
+
+print(BlackJAXSwiGConfig.model_fields.keys())
 
 jim = Jim(
     likelihood,
@@ -317,23 +349,63 @@ save_config(OUT, __file__, {
     },
 })
 
-# throughput vs batch size; us_per_eval taken at the sampler's deletion batch (n_delete)
+# # throughput vs batch size; us_per_eval taken at the sampler's deletion batch (n_delete)
+# n_delete = int(sampler_config.n_live * sampler_config.n_delete_frac)
+# f = jax.jit(jax.vmap(jim.evaluate_posterior))
+# timings = {}
+# for B in sorted({256, 1024, 4096, 16384, n_delete, sampler_config.n_live}):
+#     x = jim.prior.sample(jax.random.key(42), B)
+#     x = jnp.stack([x[k] for k in jim.prior.parameter_names]).T
+#     f(x).block_until_ready()
+#     t = time.perf_counter(); f(x).block_until_ready()
+#     timings[B] = time.perf_counter() - t
+#     print(f"{B:6d}  {timings[B]*1e3:8.2f} ms/batch  {timings[B]/B*1e6:7.2f} µs/eval")
+# us_per_eval = timings[n_delete] / n_delete * 1e6
+
 n_delete = int(sampler_config.n_live * sampler_config.n_delete_frac)
-f = jax.jit(jax.vmap(jim.evaluate_posterior))
-timings = {}
-for B in sorted({256, 1024, 4096, 16384, n_delete, sampler_config.n_live}):
-    x = jim.prior.sample(jax.random.key(42), B)
-    x = jnp.stack([x[k] for k in jim.prior.parameter_names]).T
-    f(x).block_until_ready()
-    t = time.perf_counter(); f(x).block_until_ready()
-    timings[B] = time.perf_counter() - t
-    print(f"{B:6d}  {timings[B]*1e3:8.2f} ms/batch  {timings[B]/B*1e6:7.2f} µs/eval")
+logp = jax.vmap(jim.evaluate_posterior)
+f = jax.jit(logp)
+
+@jax.jit
+def chain(x, K):
+    """K strictly sequential batched evals in a while_loop with a traced bound, like the sampler's."""
+    def body(c):
+        i, x, acc = c
+        l = logp(x)
+        x = x + jnp.where(jnp.isfinite(l), 1e-30 * l, 0.0)[:, None]   # data dependency
+        return i + 1, x, acc + l
+    return jax.lax.while_loop(lambda c: c[0] < K, body, (0, x, jnp.zeros(x.shape[0])))[2]
+
+def med_time(fn, *a, reps=20):
+    jax.block_until_ready(fn(*a))
+    ts = []
+    for _ in range(reps):
+        t = time.perf_counter(); jax.block_until_ready(fn(*a)); ts.append(time.perf_counter() - t)
+    return float(np.median(ts))
+
+def draw(B):
+    s = jim.prior.sample(jax.random.key(42), B)
+    return jnp.stack([s[k] for k in jim.prior.parameter_names]).T
+
+timings, per_trip = {}, {}
+K1, K2 = 100, 600
+for B in sorted({256, 512, 1024, 2048, 4096, 16384, n_delete, sampler_config.n_live}):
+    x = draw(B)
+    timings[B]  = med_time(f, x)
+    per_trip[B] = (med_time(chain, x, K2, reps=3) - med_time(chain, x, K1, reps=3)) / (K2 - K1)
+    print(f"{B:6d}  single {timings[B]*1e3:6.3f} ms   in-loop {per_trip[B]*1e3:6.3f} ms/trip")
 us_per_eval = timings[n_delete] / n_delete * 1e6
 
+if PROFILE:
+    with jax.profiler.trace(str(OUT / "trace"), create_perfetto_trace=True):
+        jax.block_until_ready(chain(draw(n_delete), 20))
+
 # sample
+compile_timer.reset()
 start_time = time.time()
 jim.sample()
 sampling_time = time.time() - start_time
+compile_s = compile_timer.total
 
 # save immediately to be safe
 base = {
@@ -366,6 +438,16 @@ exact_log_likelihood = jax.jit(
     lambda p: exact.evaluate(MassRatioToSymmetricMassRatioTransform.forward(p))
 )
 samples = jim.get_samples()
+
+diag   = jim.get_diagnostics()
+n_iter = diag["n_iterations"]                       # adjust key if different
+S      = STEPS_PER_DIM * len(jim.prior.parameter_names) * sampler_config.num_gibbs_sweeps
+kbar   = diag["n_likelihood_evaluations"] / (n_iter * n_delete * S)
+t_iter = (sampling_time - compile_s) / n_iter
+n_trip = t_iter / per_trip[n_delete]
+gamma_eff = n_trip / (S * kbar)
+print(f"compile {compile_s:.1f}s | t_iter {t_iter:.2f}s | kbar {kbar:.2f} | trips/iter {n_trip:.0f} | gamma_eff {gamma_eff:.1f}")
+
 het_logl = np.asarray(samples["log_likelihood"])
 n_post = len(het_logl)
 idx = np.r_[np.argmax(het_logl), np.random.default_rng(0).choice(n_post, min(N_CHECK, n_post), replace=False)]
@@ -383,18 +465,50 @@ print(f"peak logL {peak_logl:.1f} vs SNR_mf^2/2 {half_rho_sq:.1f}")
 if max_dlogl > CHECK_TOL:
     print(f"WARNING: heterodyne disagrees with exact likelihood by {max_dlogl:.3g} > {CHECK_TOL}; posterior unreliable")
 
+# chains = save_results(OUT, jim, {
+#     "n_live": sampler_config.n_live,
+#     "n_delete": n_delete,
+#     "us_per_posterior_eval": us_per_eval,
+#     "ms_per_batch": {str(B): t * 1e3 for B, t in timings.items()},
+#     "sampling_time_s": sampling_time,
+#     "check_max_abs_dlogl_het_vs_exact": max_dlogl,
+#     "check_n_samples": len(idx),
+#     "check_passed": max_dlogl <= CHECK_TOL,
+#     "peak_log_likelihood": peak_logl,
+#     "half_matched_filter_snr_sq": half_rho_sq,
+# })
+
 chains = save_results(OUT, jim, {
+    # run configuration
     "n_live": sampler_config.n_live,
     "n_delete": n_delete,
+    "steps_per_dim": STEPS_PER_DIM,
+    "delete_frac": DELETE_FRAC,
+    "sampler_seed": SAMPLER_SEED,
+
+    # benchmarks
     "us_per_posterior_eval": us_per_eval,
-    "ms_per_batch": {str(B): t * 1e3 for B, t in timings.items()},
+    "single_ms": {str(B): t * 1e3 for B, t in timings.items()},      # one jitted vmap call, median
+    "per_trip_ms": {str(B): t * 1e3 for B, t in per_trip.items()},   # per while_loop trip, marginal
+
+    # timing decomposition
     "sampling_time_s": sampling_time,
+    "compile_s": compile_s,
+    "compile_n": compile_timer.n,          # 0 ⇒ log parsing failed; compile_s is not trustworthy
+    "n_iterations": n_iter,
+    "t_iter": t_iter,                      # s per iteration, net of compilation
+    "kbar": kbar,                          # mean likelihood calls per slice step per lane
+    "n_trip": n_trip,                      # sequential loop trips per iteration (inferred)
+    "gamma_eff": gamma_eff,                # n_trip / (S · kbar): stragglers + bookkeeping overhead
+
+    # correctness checks
     "check_max_abs_dlogl_het_vs_exact": max_dlogl,
     "check_n_samples": len(idx),
     "check_passed": max_dlogl <= CHECK_TOL,
     "peak_log_likelihood": peak_logl,
     "half_matched_filter_snr_sq": half_rho_sq,
 })
+
 print(f"Likelihood evaluations: {jim.get_diagnostics()['n_likelihood_evaluations']:,}")
 
 truths = [truth_values[k] for k in jim.prior.parameter_names]
