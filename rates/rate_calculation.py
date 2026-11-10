@@ -43,7 +43,7 @@ BATCH_INSP = 20_000
 # post-merger
 FMIN_PM = 300 # Hz, checked that 100-500 makes no difference
 BATCH_PM = 5_000
-M_LO, M_HI = 2.0, 4.0           # calibrated range of the PM fits (source-frame M_tot)
+M_LO, M_HI = 2.4, 3.1           # calibrated range of the PM fits (source-frame M_tot)
 T_OBS, DUTY, Z_REF = 1.0, 1.0, 0.0 # T_OBS 1 year
 
 # prompt collapse threshold
@@ -72,8 +72,13 @@ assert np.isclose(min(_corners), M_THR_MIN) and np.isclose(max(_corners), M_THR_
 R0_min, R0_max = 8.8, 250.0     # Gpc^-3 yr^-1
 
 # DTD: P(t_d) ∝ t_d^-ALPHA on [T_D_MIN, T_D_MAX]
-T_D_MIN, T_D_MAX, ALPHA = 0.02, COSMO.age(0).to_value(u.Gyr), 1.0
-Z_FORM_MAX = 15.0
+T_D_MIN = 0.02 # 0.02 Gyr = 20 Myr from arXiv:1201.3563
+T_D_MAX = COSMO.age(0).to_value(u.Gyr)
+ALPHA = 1.0
+
+Z_FORM_MAX = 15.0 # value doesn't really matter:
+# for low z, delay time has to be large to reach Z_FORM_MAX -> unlikely due to DTD
+# for high z, cap hits but SNR for ET is already basically 0
 NTD = 128 # checked that above 128 resolution stops changing anything
 
 PSD = os.path.join(glob.detPath, 'ET-0000A-18.txt')   # ET-D, ASD
@@ -84,7 +89,9 @@ _fam = lalsim.CreateSimNeutronStarFamily(lalsim.SimNeutronStarEOSByName(EOS))
 M_MAX_EOS = lalsim.SimNeutronStarMaximumMass(_fam) / lal.MSUN_SI
 M_MIN_EOS = lalsim.SimNeutronStarFamMinimumMass(_fam) / lal.MSUN_SI
 
-M_NS_LO, M_NS_HI = 0.8, 2.0     # support of the Farrow mass model (see sample_m1m2)
+M_NS_LO = 0.8
+M_NS_HI = M_TOV_0 + Z90 * M_TOV_ERR[1]   # ≈ 2.38 Msun; must be defined after M_TOV_*
+
 assert M_MIN_EOS <= M_NS_LO and M_NS_HI < M_MAX_EOS, \
     f"{EOS} family [{M_MIN_EOS:.3f}, {M_MAX_EOS:.3f}] does not cover [{M_NS_LO}, {M_NS_HI}]"
 
@@ -148,26 +155,26 @@ def merger_rate_density(z, R0=1.0, z_ref=0.0):
 
 
 # ---------------------------------------------------------------- mass population
-def _trunc_normal(rng, mu, sigma, n, lo, hi):
-    """Normal(mu, sigma) truncated to [lo, hi] via resampling."""
-    out = rng.normal(mu, sigma, n)
-    bad = (out < lo) | (out > hi)
-    while bad.any():
-        out[bad] = rng.normal(mu, sigma, bad.sum())
-        bad = (out < lo) | (out > hi)
-    return out
 
-def sample_m1m2(rng, n,
-                mu1=1.34, sigma1=0.02, mu2=1.47, sigma2=0.15, alpha=0.68,
-                ms_lo=1.16, ms_hi=1.42, m_min=0.8, m_max=2.0):
-    # Galactic DNS mass model: Farrow 2019, https://arxiv.org/abs/1902.03300
-    first = rng.random(n) < alpha
-    m_r = np.where(first,
-                   _trunc_normal(rng, mu1, sigma1, n, m_min, m_max),
-                   _trunc_normal(rng, mu2, sigma2, n, m_min, m_max))
-    # Slow NS: uniform.
-    m_s = rng.uniform(ms_lo, ms_hi, n)
-    return np.maximum(m_r, m_s), np.minimum(m_r, m_s)
+def sample_m1m2(rng, n, eps=0.35, per_binary=False,
+                mu1=1.32, sigma1=0.11, mu2=1.80, sigma2=0.21,
+                m_min=M_NS_LO, m_max=M_NS_HI):
+    # Component masses from Sarin, Lasky & Ashton 2020 (arXiv:2001.06102), Eq. 12
+    # per_binary=False: each star picks its Gaussian iid
+    # per_binary=True:  one Gaussian is chosen per binary and both stars are drawn from it
+    ma, mb = np.empty(n), np.empty(n)
+    todo = np.ones(n, bool)
+    while todo.any():
+        idx = np.flatnonzero(todo)
+        k = idx.size
+        ha = rng.random(k) < eps
+        hb = ha if per_binary else (rng.random(k) < eps)
+        a = np.where(ha, rng.normal(mu2, sigma2, k), rng.normal(mu1, sigma1, k))
+        b = np.where(hb, rng.normal(mu2, sigma2, k), rng.normal(mu1, sigma1, k))
+        ok = (a >= m_min) & (a <= m_max) & (b >= m_min) & (b <= m_max)
+        ma[idx[ok]], mb[idx[ok]] = a[ok], b[ok]
+        todo[idx[ok]] = False
+    return np.maximum(ma, mb), np.minimum(ma, mb)
 
 # ---------------------------------------------------------------- catalogue (shared extrinsics)
 rng = np.random.default_rng(SEED)
@@ -195,7 +202,7 @@ def make_catalogue(zg, ns):
     )
     return z, ev, m1, m2
 
-# inspiral: fixed 1.4 + 1.4, full grid
+# inspiral: full grid
 z_grid       = np.geomspace(1e-3, Z_MAX, NZ)
 z_i, ev_insp, m1_i, m2_i = make_catalogue(z_grid, NS)
 
@@ -247,15 +254,22 @@ def row(fmin, N_hat):
             f"{R0_min*N_hat:12.3g} – {R0_max*N_hat:.3g}")
 
 # ---------------------------------------------------------------- (1) inspiral
+summary = []
+def report(line):
+    """Print a results line and keep it for the summary file."""
+    print(line)
+    summary.append(line)
+
 net_insp = make_net(IMRPhenomD_NRTidalv2(), FMIN_INSP)
-print(HDR)
+report("[inspiral]  IMRPhenomD_NRTidalv2")
+report(HDR)
 snr_i = compute_snr(net_insp, ev_insp, BATCH_INSP)
 P, err, N_hat = rate_from_det(snr_i >= RHO_TH_INSP, z_grid)
-print(row(FMIN_INSP, N_hat))
+report(row(FMIN_INSP, N_hat))
 
 # ---------------------------------------------------------------- (2) post-merger
-print("\n[post-merger]  PM_MPA1")
-print(HDR)
+report("\n[post-merger]  PM_MPA1")
+report(HDR)
 wf_pm   = PM_MPA1(M_lo=M_LO, M_hi=M_HI, cosmo=COSMO)
 
 snr_p = compute_snr(make_net(wf_pm, FMIN_PM), ev_pm, BATCH_PM)
@@ -267,10 +281,10 @@ _, _, N_pm_lo = rate_from_det(det_pm_lo, z_grid_pm)
 _, _, N_pm_hi = rate_from_det(det_pm_hi, z_grid_pm)
 
 
-print(row(FMIN_PM, N_pm_lo) + f"   [M_thr = {M_THR_MIN:.3f}]")
-print(row(FMIN_PM, N_pm_hi) + f"   [M_thr = {M_THR_MAX:.3f}]")
-print(f"envelope (R0 x M_thr): {R0_min*N_pm_lo:.3g} – {R0_max*N_pm_hi:.3g} /yr   "
-      f"N(M_thr_max)/N(M_thr_min) = {N_pm_hi/N_pm_lo:.3g}")
+report(row(FMIN_PM, N_pm_lo) + f"   [M_thr = {M_THR_MIN:.3f}]")
+report(row(FMIN_PM, N_pm_hi) + f"   [M_thr = {M_THR_MAX:.3f}]")
+report(f"envelope (R0 x M_thr): {R0_min*N_pm_lo:.3g} – {R0_max*N_pm_hi:.3g} /yr   "
+       f"N(M_thr_max)/N(M_thr_min) = {N_pm_hi/N_pm_lo:.3g}")
 
 # ---------------------------------------------------------------- save outputs
 OUT = f'ETS_rates_PMfmin{FMIN_PM:g}.npz'
@@ -289,3 +303,9 @@ np.savez_compressed(
     R0_min=R0_min, R0_max=R0_max,
 )
 print(f"saved -> {OUT}")
+
+# same stem and folder as the PDF written by plot.ipynb
+OUT_TXT = OUT.replace('.npz', '.txt')
+with open(OUT_TXT, 'w', encoding='utf-8') as f:
+    f.write("\n".join(summary) + "\n")
+print(f"saved -> {OUT_TXT}")
