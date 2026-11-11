@@ -22,6 +22,7 @@ from gwfast.waveforms import TaylorF2_RestrictedPN, IMRPhenomD_NRTidalv2
 from gwfast.signal import GWSignal
 from gwfast.network import DetNet
 from pm_gwfast import PM_MPA1
+from pm_nrpmw_gwfast import PM_NRPMw, kappa2T, calibration_flags, CAL_BOX
 
 jax.config.update("jax_enable_x64", True)
 
@@ -41,9 +42,18 @@ FMIN_INSP  = 5.0                # Hz
 BATCH_INSP = 20_000
 
 # post-merger
-FMIN_PM = 300 # Hz, checked that 100-500 makes no difference
+PM_MODEL = 'NRPMw'              # 'NRPMw' (Breschi+22, PM-only/attach) or 'SBS22' (Soultanis+22, MPA1)
 BATCH_PM = 5_000
-M_LO, M_HI = 2.4, 3.1           # calibrated range of the PM fits (source-frame M_tot)
+if PM_MODEL == 'SBS22':
+    FMIN_PM = 300 # Hz, checked that 100-500 makes no difference
+    M_LO, M_HI = 2.4, 3.1       # calibrated range of the PM fits (source-frame M_tot)
+elif PM_MODEL == 'NRPMw':
+    F_SRC_LO_PM, F_SRC_HI_PM = 1000., 8000.   # source-frame band (NRPMw.md); cut inside Ampl
+    T_COLL_MS, DF2_GEOM, PHI_PM = 8.0, 2e-6, np.pi / 2
+    FMIN_PM = F_SRC_LO_PM / (1 + Z_MAX_PM)    # ≈ 667 Hz detector frame: grid covers the band at all z
+    M_LO, M_HI = CAL_BOX['M']   # 2.4–3.4; q and kappa2T cuts below
+else:
+    raise ValueError(PM_MODEL)
 T_OBS, DUTY, Z_REF = 1.0, 1.0, 0.0 # T_OBS 1 year
 
 # prompt collapse threshold
@@ -206,18 +216,29 @@ def make_catalogue(zg, ns):
 z_grid       = np.geomspace(1e-3, Z_MAX, NZ)
 z_i, ev_insp, m1_i, m2_i = make_catalogue(z_grid, NS)
 
-# post-merger: dedicated low-z grid (PM model doesn't have lambdas)
+# post-merger: dedicated low-z grid. Lambda1/2 are kept (NRPMw needs them; PM_MPA1 ignores them)
 z_grid_pm    = np.geomspace(1e-3, Z_MAX_PM, NZ_PM) # checked that P_det -> 0 around Z_MAX_PM
 z_p, ev_pm, m1_p, m2_p = make_catalogue(z_grid_pm, NS)
-ev_pm = {k: v for k, v in ev_pm.items() if k not in ('Lambda1', 'Lambda2')}
-Mt = m1_p + m2_p
+Mt  = m1_p + m2_p
+q_p   = m1_p / m2_p
+k2t_p = kappa2T(m1_p, m2_p, ev_pm['Lambda1'], ev_pm['Lambda2'])
 
+# prompt collapse (NRPMw has no ringdown -> PM zeroed above M_thr): Koeppel band
 has_PM_lo = Mt < M_THR_MIN      
 has_PM_hi = Mt < M_THR_MAX      
-in_cal = (Mt >= M_LO) & (Mt <= M_HI)
+if PM_MODEL == 'NRPMw':
+    ok_M, ok_q, ok_k = calibration_flags(Mt, q_p, k2t_p)
+    in_cal = ok_M & ok_q & ok_k   # must match the mask applied inside PM_NRPMw.Ampl
+else:
+    in_cal = (Mt >= M_LO) & (Mt <= M_HI)
 print(f"M_thr in [{M_THR_MIN:.3f}, {M_THR_MAX:.3f}] Msun   "
       f"f_PM in [{has_PM_lo.mean():.3f}, {has_PM_hi.mean():.3f}]   "
       f"outside calibration = {(~in_cal).mean():.3f}   max(Mt) = {Mt.max():.3f}")
+if PM_MODEL == 'NRPMw':
+    for lab, sel in (('all', np.ones_like(Mt, bool)), ('Mt<M_thr_max', has_PM_hi)):
+        print(f"  outside cal [{lab}]: M {(~ok_M[sel]).mean():.3f}  q {(~ok_q[sel]).mean():.3f}  "
+              f"k2t {(~ok_k[sel]).mean():.3f}  any {(~in_cal[sel]).mean():.3f}   "
+              f"k2t range [{k2t_p[sel].min():.0f}, {k2t_p[sel].max():.0f}]")
 
 # ---------------------------------------------------------------- intrinsic rate integral
 z_f     = np.geomspace(z_grid[0], z_grid[-1], 4000)
@@ -268,9 +289,18 @@ P, err, N_hat = rate_from_det(snr_i >= RHO_TH_INSP, z_grid)
 report(row(FMIN_INSP, N_hat))
 
 # ---------------------------------------------------------------- (2) post-merger
-report("\n[post-merger]  PM_MPA1")
+if PM_MODEL == 'NRPMw':
+    report(f"\n[post-merger]  NRPMw (attach/PM-only, fully informed)  t_coll = {T_COLL_MS:g} ms (src)  "
+           f"M^2 alpha_peak = {DF2_GEOM:g}  phi_PM = {PHI_PM:.4g}  "
+           f"f_src in [{F_SRC_LO_PM:g}, {F_SRC_HI_PM:g}] Hz")
+    report(f"outside NRPMw calibration box: {(~in_cal).mean():.3f} (all), "
+           f"{(~in_cal[has_PM_hi]).mean():.3f} (Mt < M_thr_max)")
+    wf_pm = PM_NRPMw(t_coll_ms=T_COLL_MS, df2_geom=DF2_GEOM, phi_pm=PHI_PM,
+                     f_src_lo=F_SRC_LO_PM, f_src_hi=F_SRC_HI_PM, attach=True, cosmo=COSMO)
+else:
+    report("\n[post-merger]  PM_MPA1")
+    wf_pm = PM_MPA1(M_lo=M_LO, M_hi=M_HI, cosmo=COSMO)
 report(HDR)
-wf_pm   = PM_MPA1(M_lo=M_LO, M_hi=M_HI, cosmo=COSMO)
 
 snr_p = compute_snr(make_net(wf_pm, FMIN_PM), ev_pm, BATCH_PM)
 # out-of-calibration events have SNR=0 inside Ampl -> N_det is a lower bound
@@ -285,9 +315,13 @@ report(row(FMIN_PM, N_pm_lo) + f"   [M_thr = {M_THR_MIN:.3f}]")
 report(row(FMIN_PM, N_pm_hi) + f"   [M_thr = {M_THR_MAX:.3f}]")
 report(f"envelope (R0 x M_thr): {R0_min*N_pm_lo:.3g} – {R0_max*N_pm_hi:.3g} /yr   "
        f"N(M_thr_max)/N(M_thr_min) = {N_pm_hi/N_pm_lo:.3g}")
+if PM_MODEL == 'NRPMw':
+    report(f"NRPMw evaluations: {wf_pm.n_calls}   events with NaN/inf-zeroed bins: {wf_pm.n_sanity}")
 
 # ---------------------------------------------------------------- save outputs
-OUT = f'ETS_rates_PMfmin{FMIN_PM:g}.npz'
+# SBS22 keeps its old name (plot.ipynb reads it)
+OUT = (f'ETS_rates_PMfmin{FMIN_PM:g}.npz' if PM_MODEL == 'SBS22'
+       else f'ETS_rates_PM{PM_MODEL}_fmin{FMIN_PM:.0f}.npz')
 np.savez_compressed(
     OUT,
     # integration grid + intrinsic rate (per R0)
@@ -301,6 +335,10 @@ np.savez_compressed(
     FMIN_INSP=FMIN_INSP, FMIN_PM=FMIN_PM,
     M_THR_MIN=M_THR_MIN, M_THR_MAX=M_THR_MAX,
     R0_min=R0_min, R0_max=R0_max,
+    # PM model bookkeeping
+    PM_MODEL=PM_MODEL, q_p=q_p, k2t_p=k2t_p, in_cal=in_cal,
+    **(dict(n_sanity=wf_pm.n_sanity, T_COLL_MS=T_COLL_MS, DF2_GEOM=DF2_GEOM, PHI_PM=PHI_PM,
+            F_SRC_LO_PM=F_SRC_LO_PM, F_SRC_HI_PM=F_SRC_HI_PM) if PM_MODEL == 'NRPMw' else {}),
 )
 print(f"saved -> {OUT}")
 
