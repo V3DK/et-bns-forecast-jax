@@ -21,12 +21,13 @@ Unit conventions
 ----------------
   GWBench / hfpc : f in Hz, DL in Mpc, tc in s
   Internal model : f in kHz, t in ms, DL in km
-  Amplitude      : h_plus / h_cross return r*h [km]; hfpc divides by DL [km]
+  Amplitude      : _h_td returns r*h in geometrized units (c=G=M_sun=1, i.e.
+                   lengths in GM_sun/c^2 ~ 1.477 km; paper Table V / Fig. 13).
+                   hfpc multiplies by GM_sun/c^2 [m] and divides by DL [m]
                    to obtain dimensionless strain.
 """
 
 import numpy as np
-from scipy.signal.windows import tukey
 from scipy.interpolate import interp1d
 from scipy.constants import G, c
 
@@ -45,6 +46,12 @@ R18 = 12.55   # radius [km] of a 1.8 M_sun non-rotating NS (MPA1)
 # Time grid parameters
 T_MAX_MS = 100.0    # post-merger signal duration [ms]
 DT_MS    = 0.02     # time step [ms]  ->  f_Nyquist = 25 kHz >> 8 kHz
+
+# Duration of the simulation segment the paper's Tukey window W(t; s) spans
+# (~24 ms post-merger for the reference run, Fig. 13).  The window's roll-off
+# is a fraction s of THIS length (rise ~0.9-1.2 ms, matching the ~1 ms delay
+# described in Sec. IV A), not of the T_MAX_MS extrapolation grid.
+T_FIT_MS = 24.0
 
 
 deriv_mod       = 'numdifftools'
@@ -249,6 +256,21 @@ def _phi_peak_t(t: np.ndarray, fpeak_ts_: float, zeta_drift_: float,
     return phi
 
 
+def _tukey_rise(t: np.ndarray, s_: float, T_fit: float = T_FIT_MS) -> np.ndarray:
+    """
+    Rising edge of a Tukey window of length T_fit [ms] and roll-off s_,
+    equal to 1 afterwards.  Identical to scipy.signal.windows.tukey(N, s_) on
+    [0, s_*T_fit/2] for a grid spanning T_fit; the falling edge is dropped
+    because the model is extrapolated beyond the fitted segment.
+    """
+    W  = np.ones_like(t, dtype=float)
+    tr = 0.5 * s_ * T_fit
+    if tr > 0:
+        m = t < tr
+        W[m] = 0.5 * (1.0 - np.cos(np.pi * t[m] / tr))
+    return W
+
+
 def _h_td(t: np.ndarray,
            fpeak_ts_: float, zeta_drift_: float, t_star_: float,
            f_spiral_: float, f_2m0_: float, f_2p0_: float,
@@ -258,7 +280,7 @@ def _h_td(t: np.ndarray,
            N_: float, s_: float,
            cross: bool = False) -> np.ndarray:
     """
-    Compute r*h_{+,x}(t) [km] on the supplied time grid.
+    Compute r*h_{+,x}(t) [GM_sun/c^2] on the supplied time grid.
     All frequencies in kHz, times in ms.
     cross=False -> h_+  (sin phases)
     cross=True  -> h_x  (sin phases + pi/2, i.e. cos phases)
@@ -266,7 +288,7 @@ def _h_td(t: np.ndarray,
     ps = np.pi / 2.0 if cross else 0.0
 
     Phi_peak = _phi_peak_t(t, fpeak_ts_, zeta_drift_, t_star_, phi_peak_)
-    W        = tukey(len(t), alpha=s_)
+    W        = _tukey_rise(t, s_)
 
     h_peak = (A_peak_
               * np.exp(-t / tau_peak_)
@@ -343,8 +365,8 @@ def hfpc(f,
     -----
     Procedure
       1. Build a uniform time grid [0, T_MAX_MS] with step DT_MS [ms].
-      2. Compute r*h_{+,x}(t) [km] via _h_td (time-domain engine).
-      3. FFT to the frequency domain; dt factor gives units of km*ms = km*1e-3*s.
+      2. Compute r*h_{+,x}(t) [GM_sun/c^2] via _h_td (time-domain engine).
+      3. FFT to the frequency domain; dt factor [s] gives units of GM_sun/c^2 * s.
       4. Multiply by GM_sun/c^2 [m] (geometrized -> SI length) then
          divide by DL [m] (DL [Mpc] * MPC_TO_M) to get dimensionless strain.
       5. Apply inclination factors F_+ = (1+cos^2 iota)/2, F_x = cos(iota).
@@ -362,7 +384,7 @@ def hfpc(f,
     dt_s = DT_MS * MS_TO_S          # time step in seconds
 
     # ------------------------------------------------------------------
-    # 2. Time-domain strain  r*h [km]
+    # 2. Time-domain strain  r*h [GM_sun/c^2]
     # ------------------------------------------------------------------
     rh_plus  = _h_td(t_ms,
                      fpeak_ts_, zeta_drift_, t_star_,
@@ -381,7 +403,7 @@ def hfpc(f,
                      N_, s_, cross=True)
 
     # ------------------------------------------------------------------
-    # 3. FFT  ->  units: km * s  (km * dt_s per sample)
+    # 3. FFT  ->  units: (GM_sun/c^2) * s  (dt_s per sample)
     # ------------------------------------------------------------------
     Hfp_fft  = np.fft.rfft(rh_plus)  * dt_s
     Hfc_fft  = np.fft.rfft(rh_cross) * dt_s

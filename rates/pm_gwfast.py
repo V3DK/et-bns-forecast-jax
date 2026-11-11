@@ -48,9 +48,10 @@ class PM_MPA1(WaveFormModel):
     dM         : mass-grid spacing [Msun] (nearest-node lookup).
     f_src_lo, f_src_hi : source-frame band kept in the table [Hz].
     n_fft      : zero-padded FFT length (dt = pm.DT_MS); 2**16 -> df ~ 0.76 Hz.
-    amp_norm   : length [m] converting the model's r*h to SI.  Default copies
-                 hfpc (GM_sun/c^2).  CHECK THIS: hfpc's docstring says r*h is in
-                 km, in which case amp_norm should be 1e3.
+    amp_norm   : length [m] converting the model's r*h to SI.  GM_sun/c^2 is
+                 correct: the paper's amplitudes are for r*h in c=G=M_sun=1
+                 units (Table V); checked against Figs. 13-14 (r*h_+ ~ 0.5,
+                 h_eff(40 Mpc) ~ 3e-21 at 2.5 Msun).
     cosmo      : astropy cosmology used to invert d_L -> z.  Must match the one
                  used to build the catalogue.
     """
@@ -73,7 +74,7 @@ class PM_MPA1(WaveFormModel):
         self.table = np.empty((len(self.M_grid), band.sum()))
         for j, M in enumerate(self.M_grid):
             p = pm.get_params(M)
-            rh = pm._h_td(t, *[p[k] for k in _KEYS])          # same taper as hfpc
+            rh = pm._h_td(t, *[p[k] for k in _KEYS])          # same taper as hfpc (rise over s*T_FIT_MS/2)
             self.table[j] = np.abs(np.fft.rfft(rh, n=n_fft)[band]) * dt * amp_norm
 
         # ---- d_L [Gpc] -> z
