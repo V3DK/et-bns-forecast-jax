@@ -1,0 +1,106 @@
+[workspace]
+name = "et-bns-forecast-jax"
+channels = ["conda-forge"]
+# pixi's default glibc floor for linux-64 is 2.28 = CSD3 (RHEL 8); the RHEL box has 2.34.
+# linux-64-cuda is linux-64 plus a CUDA 12 driver; only neutron-gpu uses it.
+platforms = [
+  "osx-arm64",
+  "linux-64",
+  { name = "linux-64-cuda", platform = "linux-64", cuda = "12" },
+]
+
+# ---------------------------------------------------------------- dev tools
+[feature.dev.dependencies]
+jupyter = "*"
+ipykernel = "*"
+pytest = "*"
+ruff = "*"
+
+# ---------------------------------------------------------------- rates/
+# gwfast 1.1.2 caps: jax<=0.4.30, numpy<=1.26.4, astropy 6.0.x, numdifftools==0.9.41
+[feature.gwfast]
+platforms = ["osx-arm64", "linux-64"]
+
+[feature.gwfast.dependencies]
+python = "3.12.*"
+numpy = "<=1.26.4"
+jax = "==0.4.28"    # conda-forge has no jax 0.4.30; 0.4.28 is the newest inside gwfast's range
+jaxlib = { version = "==0.4.28", build = "*cpu*" }
+astropy = "6.0.*"
+scipy = ">=1.6.3"
+h5py = "*"
+mpmath = "*"
+numdifftools = "==0.9.41"
+schwimmbad = ">=0.3.2,<0.4"
+matplotlib-base = "*"
+python-lalsimulation = "*"
+bilby = "*"
+gwpy = "*"
+
+[feature.gwfast.pypi-dependencies]
+gwfast = "==1.1.2"
+
+# ---------------------------------------------------------------- inference/
+[feature.neutron.dependencies]
+python = "3.12.*"
+jax = "==0.9.0"
+numpy = "*"
+scipy = ">=1.17.1"
+astropy-base = ">=7.0.1"
+pandas = "*"
+h5py = "*"
+h5netcdf = "*"
+matplotlib-base = "*"
+corner = "*"
+bilby = "*"
+python-lalsimulation = "*"
+gwpy = "*"
+gwosc = "*"
+gwdatafind = "*"
+dqsegdb2 = "*"
+ligotimegps = "*"
+dynesty = "*"
+numdifftools = "*"
+dateparser = "*"
+blackjax = "*"
+equinox = "*"
+jaxtyping = "*"
+lineax = "*"
+optimistix = "*"
+diffrax = "*"
+flax = "*"
+optax = "*"
+orbax-checkpoint = "*"
+# conda-forge-available dependencies of the PyPI packages below
+anesthetic = "*"
+beartype = "*"
+pydantic = ">=2"
+tomli-w = "*"
+typer = "*"
+dotmap = "*"
+tqdm = "*"
+requests = "*"
+
+[feature.neutron.pypi-dependencies]
+jimgw = "==0.5.2"
+flowmc = "==0.6.4"
+ripplegw = "==0.4.1"
+evosax = "==0.3.2"
+
+[feature.cpu]
+platforms = ["osx-arm64", "linux-64"]
+
+[feature.cpu.dependencies]
+jaxlib = { version = "==0.9.0", build = "*cpu*" }
+
+[feature.gpu]
+platforms = ["linux-64-cuda"]
+
+[feature.gpu.dependencies]
+jaxlib = { version = "==0.9.0", build = "*cuda12*" }
+
+# ---------------------------------------------------------------- environments
+[environments]
+gwfast      = { features = ["gwfast", "dev"],         no-default-feature = true }
+neutron-cpu = { features = ["neutron", "cpu", "dev"], no-default-feature = true }
+neutron-gpu = { features = ["neutron", "gpu", "dev"], no-default-feature = true }
