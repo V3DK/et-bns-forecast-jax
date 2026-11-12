@@ -18,6 +18,7 @@ SAMPLER_SEED  = int(os.environ.get("SAMPLER_SEED", 2))
 STEPS_PER_DIM = int(os.environ.get("STEPS_PER_DIM", 5))
 DELETE_FRAC   = float(os.environ.get("DELETE_FRAC", 0.5))
 PROFILE       = os.environ.get("PROFILE", "0") not in ("", "0")
+N_BINS        = os.environ.get("N_BINS")   # heterodyne bins; unset -> heterodyne.DEFAULT_N_BINS
 
 def _perf_cores():
     """Mac performance-core count; efficiency cores straggle and stall synchronised steps."""
@@ -92,15 +93,17 @@ from jimgw.core.prior import (
     PowerLawPrior
 )
 from jimgw.core.single_event.detector import get_ET
-from jimgw.core.single_event.likelihood import HeterodynedTransientLikelihoodFD, TransientLikelihoodFD
+from jimgw.core.single_event.likelihood import TransientLikelihoodFD
 from jimgw.core.single_event.waveform import RippleIMRPhenomD_NRTidalv2
 from jimgw.core.single_event.transforms import MassRatioToSymmetricMassRatioTransform
 from jimgw.samplers.config import BlackJAXSwiGConfig
 
 from run_io import describe_prior, prior_space_truths, save_config, save_results
+from heterodyne import BinnedHeterodynedLikelihoodFD, DEFAULT_N_BINS
 
 # RUN_NAME = f"{'4p' if INTRINSIC_ONLY else '12p'}_{os.environ.get('SLURM_JOB_ID', f'{datetime.now():%Y%m%d_%H%M%S}')}"
 RUN_NAME = (f"{'4p' if INTRINSIC_ONLY else '12p'}_s{STEPS_PER_DIM}_f{DELETE_FRAC}_seed{SAMPLER_SEED}_"
+            f"{f'b{N_BINS}_' if N_BINS else ''}"
             f"{os.environ.get('SLURM_JOB_ID', f'{datetime.now():%Y%m%d_%H%M%S}')}")
 
 RUNS_ROOT = Path(os.environ.get("RUNS_DIR", Path(__file__).resolve().parent / "runs"))
@@ -232,7 +235,9 @@ likelihood_transforms = [MassRatioToSymmetricMassRatioTransform]
 
 phase_marginalization = True
 
-likelihood = HeterodynedTransientLikelihoodFD(
+# jimgw's default (epsilon=0.5) gives ~60 bins: too coarse, |dlogL| up to ~1 (results doc, section 2)
+n_bins = int(N_BINS) if N_BINS else DEFAULT_N_BINS
+likelihood = BinnedHeterodynedLikelihoodFD(
     ifos,
     waveform=waveform,
     fixed_parameters=fixed_parameters,
@@ -241,7 +246,9 @@ likelihood = HeterodynedTransientLikelihoodFD(
     f_max=f_max_likelihood,
     reference_parameters=injection_parameters,
     phase_marginalization=phase_marginalization,
+    n_bins=n_bins,
 )
+print(f"heterodyne bins: {likelihood.n_bins} (requested {n_bins})")
 
 if INTRINSIC_ONLY:
     # only this one block because 4 param
@@ -337,6 +344,7 @@ save_config(OUT, __file__, {
         "fixed_parameters": fixed_parameters,
         "f_max": f_max_likelihood,
         "cutoff_threshold": CUTOFF_THRESHOLD,
+        "n_bins": int(likelihood.n_bins),
     },
     "prior": describe_prior(prior),
     "parameter_names": list(jim.prior.parameter_names),
@@ -424,7 +432,7 @@ print(f"Sampling took {sampling_time / 60:.2f} mins")
 
 # post-run check: re-evaluate the max-likelihood sample + random posterior samples with the exact
 # likelihood; a large difference means the heterodyne was wrong where the sampler went
-N_CHECK, CHECK_TOL = 50, 0.5
+N_CHECK, CHECK_TOL = 50, 0.1   # 500 bins gave max |dlogL| <= 0.01 on CPU tests (results doc, section 2)
 exact = TransientLikelihoodFD(
     ifos,
     waveform=waveform,
