@@ -180,6 +180,7 @@ def run_event(init, step, ev, positions, key, settings):
         "t_init": t_init,
         "t_first_step": t_first_step,
         "t_steps": t_steps,
+        "nested_samples": ns,
     }
     out["t_finalise"] = time.perf_counter() - t0
     return out
