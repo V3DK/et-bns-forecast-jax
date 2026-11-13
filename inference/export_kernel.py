@@ -162,10 +162,24 @@ def export_sampler(out_dir, init, step, model, settings, rebuild, ev, positions,
     return {"t_export_init": t_init, "t_export_step": t_step, "bytes": n_bytes}
 
 
-def load_sampler(export_dir, model, settings, rebuild, ev):
+def _init_cpu_lapack():
+    """Make jaxlib's CPU LAPACK custom calls usable in a process that never lowers a LAPACK op.
+
+    The exported step calls `lapack_dpotrf_ffi` (Cholesky). jaxlib fills in its LAPACK function
+    pointers lazily, in `jaxlib.lapack.prepare_lapack_call`, which runs only while a LAPACK op is being
+    *lowered*. A process that only loads the export never lowers one, so the call jumps through an unset
+    pointer and segfaults (T5 runs 2 and 3; reproduced with an exported `jnp.linalg.cholesky`). Lowering
+    a tiny Cholesky (no compile, no execution) triggers the initialisation; it takes milliseconds.
+    """
+    if jax.default_backend() == "cpu":
+        jax.jit(jax.numpy.linalg.cholesky).lower(jax.numpy.eye(2))
+
+
+def load_sampler(export_dir, model, settings, rebuild, ev, donate=True):
     """Load an export as `init(positions, ev)` and `step(key, state, ev)`, without tracing either.
 
-    `ev` is any one event's `EventData`, used only to check the manifest. Raises `ExportMismatch` if the
+    `ev` is any one event's `EventData`, used only to check the manifest. `donate=False` turns off
+    donation of the state buffers into the loaded step (T5: it segfaulted on CPU). Raises `ExportMismatch` if the
     manifest disagrees with this process (a caller may then fall back to `kernel.make_sampler`). The
     returned functions carry their underlying jitted wrapper as `.jitted` (for `_cache_size()`); the
     wrappers are named `ns_init_exported` and `ns_step_exported` in JAX's logs.
@@ -177,6 +191,7 @@ def load_sampler(export_dir, model, settings, rebuild, ev):
         raise ExportMismatch(diffs)
     with open(export_dir / "treedefs.pkl", "rb") as f:
         td = pickle.load(f)
+    _init_cpu_lapack()
     exp_init = jax.export.deserialize(bytearray((export_dir / "ns_init.bin").read_bytes()))
     exp_step = jax.export.deserialize(bytearray((export_dir / "ns_step.bin").read_bytes()))
 
@@ -187,7 +202,7 @@ def load_sampler(export_dir, model, settings, rebuild, ev):
         return exp_step.call(key_data, state_leaves, ev_leaves)
 
     init_jit = jax.jit(ns_init_exported)
-    step_jit = jax.jit(ns_step_exported, donate_argnums=1)
+    step_jit = jax.jit(ns_step_exported, donate_argnums=1 if donate else ())
 
     def flatten(tree, treedef, what):
         leaves, got = jax.tree.flatten(tree)

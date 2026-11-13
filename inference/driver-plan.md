@@ -117,6 +117,8 @@ Both layers below work only after 2.1–2.3, once the compiled program no longer
 - Export on the target platform, i.e. on the CSD3 GPU node in the warm job.
 - **Manifest** stored with the artifact: jax/jaxlib/jimgw/blackjax/ripplegw versions, `pixi.lock` hash, a hash of the program's sources (`kernel.py`, `event_model.py`), n_live, `N_BINS` and the `EventData` signature, steps per dimension, delete fraction, blocks, `INTRINSIC_ONLY`, waveform, x64, PRNG implementation, backend, `device_kind` and CPU architecture. Load the artifact only if all of these match; otherwise trace normally and log a warning. The git hash is recorded but not matched (passed in with `--git-hash`, so the code never calls git).
 - Needs `python-flatbuffers` in the environment.
+- **CPU gotcha (found in T5):** the step calls LAPACK Cholesky, whose jaxlib function pointers are set only when a LAPACK op is *lowered*. A process that just loads the export segfaults on the first step unless it lowers one first; `load_sampler` does this. Check the GPU equivalent (cuSOLVER) in the warm job.
+- **T5 result (CPU, n_live 256, 4 params):** a load with a cache hit spends 0.5 s in init and 8.8 s in the first step, against 5.2 s and 38.3 s in T4 run 2 (persistent cache only), with results bit-identical to T4.
 - Implemented in `export_kernel.py`; T5 runs through `check_kernel.py --export-out / --load-export`.
 
 ### Priority

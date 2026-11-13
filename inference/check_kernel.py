@@ -180,6 +180,8 @@ def main():
     ap.add_argument("--compare-to", help="earlier --summary-out JSON; results must match it exactly")
     ap.add_argument("--export-out", help="after sampling, export init/step to this new directory (T5)")
     ap.add_argument("--load-export", help="load init/step from this export instead of tracing them (T5)")
+    ap.add_argument("--no-donate", action="store_true",
+                    help="with --load-export: don't donate the state buffers to the loaded step")
     ap.add_argument("--git-hash", help="recorded in the export manifest (informational)")
     args = ap.parse_args()
     if args.export_out and args.load_export:
@@ -259,12 +261,13 @@ def main():
             if args.load_export:
                 t0 = time.perf_counter()
                 try:
-                    init, step = load_sampler(args.load_export, model, settings, rebuild, ev)
+                    init, step = load_sampler(args.load_export, model, settings, rebuild, ev,
+                                              donate=not args.no_donate)
                 except ExportMismatch as e:
                     print(f"  FAIL: {e}")
                     raise SystemExit(1)
                 info = init.manifest["info"]
-                print(f"  loaded export {args.load_export} in {time.perf_counter() - t0:.2f} s "
+                print(f"  loaded export {args.load_export} (donate {not args.no_donate}) in {time.perf_counter() - t0:.2f} s "
                       f"(made {info['created']} on {info['host']}, git {info['git_hash']})")
             else:
                 init, step = make_sampler(model, settings, rebuild)

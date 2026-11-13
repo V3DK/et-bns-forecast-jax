@@ -1,0 +1,16 @@
+{
+ "events": {
+  "0": {
+   "log_Z": 2428.9697796620135,
+   "n_iterations": 30,
+   "n_likelihood_evaluations": 248842,
+   "n_posterior": 367,
+   "posterior_sha256": "f4eee1e84d757826e660b3cdb85ab660f100a9aa065b8eb20da05385cc5169bb"
+  }
+ },
+ "settings": "SamplerSettings(n_live=256, delete_frac=0.5, steps_per_dim=5, num_gibbs_sweeps=1, termination_dlogz=0.5)",
+ "n_bins": 500,
+ "layout": "4p",
+ "jax": "0.9.0",
+ "mode": "load-export"
+}
