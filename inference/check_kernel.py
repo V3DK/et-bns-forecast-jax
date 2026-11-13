@@ -13,12 +13,27 @@ weak type or shape that differs between events' EventData).
 
 T7 later: the same with --all-params (12 parameters) and --no-log-compiles; then only cache sizes and
 the first-step timings are available.
+
+Test T4: the same script, run as separate processes that share a persistent compilation cache
+(--cache-dir). Process 1 (--expect-cache miss, empty dir) must miss and write `ns_init`/`ns_step`;
+process 2 (--expect-cache hit) must load both from disk: one cache hit each, no miss, and no
+"Not writing persistent cache entry" record. Tracing and lowering still run in every process; with
+log_compiles, JAX's "Finished XLA compilation" record also appears on a hit (it times the disk load).
+--summary-out writes ln Z, iteration/evaluation counts and a hash of the posterior samples per event;
+--compare-to checks them for exact equality against an earlier run's summary.
+
+    python check_kernel.py --catalogue catalogue.csv --events 0 --cache-dir jax_cache_t4 \
+        --expect-cache miss --summary-out t4_run1.json
+    python check_kernel.py --catalogue catalogue.csv --events 0 --cache-dir jax_cache_t4 \
+        --expect-cache hit --summary-out t4_run2.json --compare-to t4_run1.json
 """
 import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import argparse
+import hashlib
+import json
 import logging
 import re
 import sys
@@ -36,7 +51,8 @@ from check_event_model import jimgw_prior
 from event_model import FIXED_PARAMS, EventModel, event_data_from_likelihood, gibbs_blocks
 from heterodyne import DEFAULT_N_BINS
 from injection import inject, make_likelihood, make_waveform, read_catalogue
-from kernel import SamplerSettings, make_sampler, rebuild_required_by_block, run_event
+from kernel import (SamplerSettings, enable_persistent_cache, make_sampler, rebuild_required_by_block,
+                    run_event)
 
 KERNEL_FUNS = ("ns_init", "ns_step")
 STAGES = ("trace", "lower", "compile", "cache_hit")
@@ -45,6 +61,8 @@ _PATTERNS = [
     ("lower", re.compile(r"^Finished jaxpr to MLIR module conversion (?:jit[_(])?([\w.<>-]+)\)? in ([\d.e-]+) sec")),
     ("compile", re.compile(r"^Finished XLA compilation of (?:jit[_(])?([\w.<>-]+)\)? in ([\d.e-]+) sec")),
     ("cache_hit", re.compile(r"^Persistent compilation cache hit for '(?:jit[_(])?([\w.<>-]+)'()")),
+    ("cache_miss", re.compile(r"^PERSISTENT COMPILATION CACHE MISS for '(?:jit[_(])?([\w.<>-]+)'()")),
+    ("not_written", re.compile(r"^Not writing persistent cache entry for '(?:jit[_(])?([\w.<>-]+)'()")),
 ]
 _QUIET = re.compile(r"^(Finished |Compiling |Persistent compilation cache|Not writing persistent cache)")
 
@@ -71,8 +89,14 @@ class CompileLog(logging.Handler):
                 if m.group(2):
                     self.seconds[fun, stage] += float(m.group(2))
                 if fun in KERNEL_FUNS:
-                    print(f"    [jax] {stage:9s} {fun}" + (f" {float(m.group(2)):.2f} s" if m.group(2) else ""))
+                    if stage == "not_written":       # JAX's reason is the point of this record
+                        print(f"    [jax] {stage:9s} {msg}")
+                    else:
+                        print(f"    [jax] {stage:9s} {fun}"
+                              + (f" {float(m.group(2)):.2f} s" if m.group(2) else ""))
                 return
+        if record.levelno < logging.WARNING:         # debug chatter from jax._src.compiler (T4 mode)
+            return
         if not _QUIET.match(msg):
             print(f"[{record.name}] {msg}", file=sys.stderr)
 
@@ -83,6 +107,37 @@ class CompileLog(logging.Handler):
 def signature(ev):
     """Abstract signature of an EventData: what decides whether the kernel recompiles."""
     return jax.tree.map(lambda a: (a.shape, str(a.dtype), bool(getattr(a, "weak_type", False))), ev)
+
+
+def event_summary(res):
+    """What must be bit-identical between two runs of the same event and seed on one machine.
+
+    `log_Z_error` is left out: anesthetic draws its ln Z samples from numpy's unseeded global RNG.
+    """
+    post = np.ascontiguousarray(res["posterior_samples"], dtype=np.float64)
+    return {"log_Z": float(res["log_Z"]),                    # JSON keeps the full float64 repr
+            "n_iterations": int(res["n_iterations"]),
+            "n_likelihood_evaluations": int(res["n_likelihood_evaluations"]),
+            "n_posterior": int(post.shape[0]),
+            "posterior_sha256": hashlib.sha256(post.tobytes()).hexdigest()}
+
+
+def compare_summaries(summary, path):
+    """Exact comparison against an earlier run's --summary-out, over the events both ran."""
+    with open(path) as f:
+        ref = json.load(f)["events"]
+    common = sorted(set(summary) & set(ref), key=int)
+    print(f"\n=== exact comparison with {path} (events {common})")
+    if not common:
+        print("  FAIL: no events in common")
+        return False
+    ok = True
+    for eid in common:
+        diffs = {k: (summary[eid][k], ref[eid].get(k)) for k in summary[eid] if summary[eid][k] != ref[eid].get(k)}
+        ok &= not diffs
+        print(f"  event {eid}: " + ("identical" if not diffs else
+                                   "FAIL: " + "; ".join(f"{k} {a!r} vs {b!r}" for k, (a, b) in diffs.items())))
+    return ok
 
 
 def main():
@@ -97,7 +152,20 @@ def main():
     ap.add_argument("--all-params", action="store_true", help="12-parameter layout (T7); default intrinsic only")
     ap.add_argument("--no-log-compiles", action="store_true", help="skip jax_log_compiles (T7 timing runs)")
     ap.add_argument("--explain-cache-misses", action="store_true")
+    ap.add_argument("--cache-dir", help="persistent compilation cache directory (T4)")
+    ap.add_argument("--expect-cache", choices=["miss", "hit"],
+                    help="T4 pass condition for ns_init/ns_step: 'miss' = compiled and written (empty dir), "
+                         "'hit' = loaded from --cache-dir")
+    ap.add_argument("--summary-out", help="write per-event ln Z, counts and posterior hash to this JSON")
+    ap.add_argument("--compare-to", help="earlier --summary-out JSON; results must match it exactly")
     args = ap.parse_args()
+    if args.expect_cache and not args.cache_dir:
+        ap.error("--expect-cache needs --cache-dir")
+    if args.expect_cache and args.no_log_compiles:
+        ap.error("--expect-cache needs the jax_log_compiles records; drop --no-log-compiles")
+
+    cache_dir = enable_persistent_cache(args.cache_dir) if args.cache_dir else None
+    test = "T4" if args.expect_cache else "T2"
 
     intrinsic_only = not args.all_params
     log = None
@@ -108,6 +176,14 @@ def main():
         jax_logger.addHandler(log)
         jax_logger.setLevel(logging.WARNING)
         jax_logger.propagate = False
+        if cache_dir is not None:
+            # Cache misses and "Not writing ..." are DEBUG unless jax_explain_cache_misses is on (which
+            # also floods tracing-cache explanations). Route this one module's records, DEBUG included,
+            # only to our handler, which counts the cache records and drops the rest.
+            compiler_logger = logging.getLogger("jax._src.compiler")
+            compiler_logger.addHandler(log)
+            compiler_logger.setLevel(logging.DEBUG)
+            compiler_logger.propagate = False
     if args.explain_cache_misses:
         jax.config.update("jax_explain_cache_misses", True)
         if log is not None:
@@ -122,8 +198,13 @@ def main():
     model = EventModel(waveform, intrinsic_only)
     blocks = gibbs_blocks(intrinsic_only)
     layout = "4p" if intrinsic_only else "12p"
-    print(f"T2: {layout}, events {args.events}, {settings}, n_bins {args.n_bins}, "
-          f"backend {jax.default_backend()}, devices {jax.devices()}")
+    print(f"{test}: {layout}, events {args.events}, {settings}, n_bins {args.n_bins}, "
+          f"backend {jax.default_backend()}, devices {jax.devices()}, jax {jax.__version__}")
+    if cache_dir is not None:
+        n_entries = sum(1 for p in cache_dir.iterdir() if p.is_file())
+        print(f"persistent cache: {cache_dir} ({n_entries} files at start), expect {args.expect_cache or '-'}")
+        if args.expect_cache == "miss" and n_entries:
+            print("  WARN: cache dir is not empty; ns_init/ns_step may hit instead of miss")
 
     init = step = rebuild = sig0 = None
     results, ok = [], True
@@ -196,6 +277,7 @@ def main():
         line = f"  {name}: jit cache size {n_cache}"
         ok &= n_cache == 1
         if log:
+            # with a persistent-cache hit, the "compile" record times the disk load instead
             for stage in ("trace", "lower", "compile"):
                 n = log.counts.get((name, stage), 0)
                 ok &= n == 1
@@ -205,7 +287,32 @@ def main():
         n_other = sum(n for (f, s), n in log.counts.items() if f not in KERNEL_FUNS and s == "compile")
         print(f"  other XLA compiles (eager ops, finalise, prior draws; informational): {n_other}")
 
-    print(f"\nT2 {'PASSED' if ok else 'FAILED'}")
+    if cache_dir is not None and log:
+        want = {"miss": {"cache_hit": 0, "cache_miss": 1, "not_written": 0},
+                "hit": {"cache_hit": 1, "cache_miss": 0, "not_written": 0}}.get(args.expect_cache)
+        print(f"\n=== persistent cache records (expect {args.expect_cache or '-'})")
+        for name in KERNEL_FUNS:
+            got = {s: log.counts.get((name, s), 0) for s in ("cache_hit", "cache_miss", "not_written")}
+            bad = want is not None and got != want
+            ok &= not bad
+            print(f"  {name}: hit {got['cache_hit']}, miss {got['cache_miss']}, not written "
+                  f"{got['not_written']}" + (f"  FAIL: expected {want}" if bad else ""))
+        hits = sum(n for (f, s), n in log.counts.items() if f not in KERNEL_FUNS and s == "cache_hit")
+        misses = sum(n for (f, s), n in log.counts.items() if f not in KERNEL_FUNS and s == "cache_miss")
+        print(f"  other functions (informational): {hits} hits, {misses} misses")
+        n_entries = sum(1 for p in cache_dir.iterdir() if p.is_file())
+        print(f"  {cache_dir}: {n_entries} files at end")
+
+    summary = {str(eid): event_summary(res) for eid, res, _, _ in results}
+    if args.summary_out:
+        with open(args.summary_out, "w") as f:
+            json.dump({"events": summary, "settings": repr(settings), "n_bins": args.n_bins,
+                       "layout": layout, "jax": jax.__version__}, f, indent=1)
+        print(f"\nwrote {args.summary_out}")
+    if args.compare_to:
+        ok &= compare_summaries(summary, args.compare_to)
+
+    print(f"\n{test} {'PASSED' if ok else 'FAILED'}")
     raise SystemExit(0 if ok else 1)
 
 

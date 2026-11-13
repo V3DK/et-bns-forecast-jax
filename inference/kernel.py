@@ -19,6 +19,7 @@ import importlib.metadata
 import time
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -40,6 +41,24 @@ for _pkg, _ver in PINNED.items():
     if importlib.metadata.version(_pkg) != _ver:
         raise ImportError(f"kernel.py uses private {_pkg} {_ver} internals; found "
                           f"{importlib.metadata.version(_pkg)}. Re-check the copies before changing the pin.")
+
+
+def enable_persistent_cache(cache_dir):
+    """Turn on JAX's persistent compilation cache in `cache_dir` (driver-plan.md, section 3a).
+
+    Call before the first jit call of the process. Every executable is cached whatever its compile
+    time or size, so a later process loads the kernel's XLA compile from disk; tracing and lowering
+    still run. jimgw sets (and afterwards deletes) its own cache dir only inside `Jim.sample()`, which
+    this module never calls. Returns the resolved path.
+    """
+    if not jax.config.jax_enable_compilation_cache:
+        raise RuntimeError("jax_enable_compilation_cache is off; the persistent cache would be ignored")
+    path = Path(cache_dir).resolve()
+    path.mkdir(parents=True, exist_ok=True)
+    jax.config.update("jax_compilation_cache_dir", str(path))
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
+    jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)   # -1: no size limit, no override
+    return path
 
 
 @dataclass(frozen=True)
