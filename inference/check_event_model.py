@@ -27,7 +27,6 @@ import numpy as np
 jax.config.update("jax_enable_x64", True)
 
 from jimgw.core.jim import Jim
-from jimgw.core.prior import CombinePrior, CosinePrior, PowerLawPrior, SinePrior, UniformPrior
 from jimgw.core.single_event.transforms import MassRatioToSymmetricMassRatioTransform
 from jimgw.samplers.config import BlackJAXSwiGConfig
 
@@ -35,22 +34,9 @@ from event_model import (ALL_PARAMS, FIXED_PARAMS, FIXED_PRIORS, EventModel, eve
                          gibbs_blocks)
 from heterodyne import DEFAULT_N_BINS
 from injection import inject, make_likelihood, make_waveform, read_catalogue
+from prepare import jimgw_prior   # moved to prepare.py (no JAX_PLATFORMS side effect); re-exported
 
 TOL = 1e-9
-
-
-def jimgw_prior(mc_lo, mc_hi, intrinsic_only):
-    """The CombinePrior from swig.py, built from event_model.FIXED_PRIORS so the two cannot drift."""
-    def one(name):
-        if name == "M_c":
-            return UniformPrior(mc_lo, mc_hi, parameter_names=["M_c"])
-        kind, *args = FIXED_PRIORS[name]
-        return {"uniform": lambda: UniformPrior(*args, parameter_names=[name]),
-                "sine": lambda: SinePrior(parameter_names=[name]),
-                "cosine": lambda: CosinePrior(parameter_names=[name]),
-                "powerlaw": lambda: PowerLawPrior(*args, parameter_names=[name])}[kind]()
-    names = ALL_PARAMS[:4] if intrinsic_only else ALL_PARAMS
-    return CombinePrior([one(n) for n in names])
 
 
 def make_jim(likelihood, prior, intrinsic_only, ckpt_dir):

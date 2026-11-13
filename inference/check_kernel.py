@@ -62,10 +62,10 @@ import numpy as np
 
 jax.config.update("jax_enable_x64", True)
 
-from check_event_model import jimgw_prior
-from event_model import FIXED_PARAMS, EventModel, event_data_from_likelihood, gibbs_blocks
+from event_model import EventModel, gibbs_blocks
 from heterodyne import DEFAULT_N_BINS
-from injection import inject, make_likelihood, make_waveform, read_catalogue
+from injection import make_waveform, read_catalogue
+from prepare import prepare_event
 from export_kernel import ExportMismatch, export_sampler, load_sampler
 from kernel import (SamplerSettings, enable_persistent_cache, make_sampler, rebuild_required_by_block,
                     run_event)
@@ -238,17 +238,9 @@ def main():
     results, ok = [], True
     for eid in args.events:
         row = rows[eid]
-        t0 = time.perf_counter()
-        inj = inject(row, waveform)
-        lik = make_likelihood(inj, waveform, n_bins=args.n_bins,
-                              fixed_names=FIXED_PARAMS if intrinsic_only else ())
-        ev = event_data_from_likelihood(lik, inj.mc_lo, inj.mc_hi, inj.params)
-        key = jax.random.key(row["sampler_seed"])
-        prior_key, sampler_key = jax.random.split(key)
-        draws = jimgw_prior(inj.mc_lo, inj.mc_hi, intrinsic_only).sample(prior_key, settings.n_live)
-        positions = jnp.stack([draws[k] for k in model.names]).T
-        t_setup = time.perf_counter() - t0
-        snr = float(np.sqrt(sum(float(ifo.optimal_snr) ** 2 for ifo in inj.ifos)))
+        prep = prepare_event(row, waveform, model, settings.n_live, args.n_bins)
+        inj, lik, ev, positions, sampler_key = prep.inj, prep.likelihood, prep.ev, prep.positions, prep.sampler_key
+        t_setup, snr = prep.t_setup, prep.snr["network"]
         print(f"\n=== event {eid}: d_L={row['d_L']:.0f} Mpc duration={inj.duration:.0f} s "
               f"f_max_lik={inj.f_max_likelihood:.0f} Hz SNR={snr:.1f} [host setup {t_setup:.1f} s]")
 
