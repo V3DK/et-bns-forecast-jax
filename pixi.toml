@@ -71,6 +71,7 @@ diffrax = "*"
 flax = "*"
 optax = "*"
 orbax-checkpoint = "*"
+python-flatbuffers = "*"   # jax.export serialisation (inference/export_kernel.py)
 # conda-forge-available dependencies of the PyPI packages below
 anesthetic = "*"
 beartype = "*"

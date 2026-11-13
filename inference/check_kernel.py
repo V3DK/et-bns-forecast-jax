@@ -26,6 +26,21 @@ log_compiles, JAX's "Finished XLA compilation" record also appears on a hit (it 
         --expect-cache miss --summary-out t4_run1.json
     python check_kernel.py --catalogue catalogue.csv --events 0 --cache-dir jax_cache_t4 \
         --expect-cache hit --summary-out t4_run2.json --compare-to t4_run1.json
+
+Test T5: the sampler saved with jax.export (export_kernel.py) and loaded in later processes, which must
+not trace `ns_init`/`ns_step` at all. --export-out DIR runs as T2/T4, then exports the traced functions.
+--load-export DIR replaces make_sampler with export_kernel.load_sampler; the jitted wrappers around the
+loaded programs are `ns_init_exported`/`ns_step_exported`, and the T2/T4 checks (one trace, lower and
+compile each; --expect-cache) apply to those instead. The wrapper's module differs from the one T4
+cached, so the first load misses the persistent cache and later loads hit it. Results must match the
+T4 run exactly (--compare-to).
+
+    python check_kernel.py --catalogue catalogue.csv --events 0 --cache-dir jax_cache_t5 \
+        --export-out export_t5 --summary-out t5_run1.json --compare-to t4_run1.json
+    python check_kernel.py --catalogue catalogue.csv --events 0 --cache-dir jax_cache_t5 \
+        --load-export export_t5 --expect-cache miss --summary-out t5_run2.json --compare-to t4_run1.json
+    python check_kernel.py --catalogue catalogue.csv --events 0 --cache-dir jax_cache_t5 \
+        --load-export export_t5 --expect-cache hit --summary-out t5_run3.json --compare-to t4_run1.json
 """
 import os
 
@@ -51,10 +66,14 @@ from check_event_model import jimgw_prior
 from event_model import FIXED_PARAMS, EventModel, event_data_from_likelihood, gibbs_blocks
 from heterodyne import DEFAULT_N_BINS
 from injection import inject, make_likelihood, make_waveform, read_catalogue
+from export_kernel import ExportMismatch, export_sampler, load_sampler
 from kernel import (SamplerSettings, enable_persistent_cache, make_sampler, rebuild_required_by_block,
                     run_event)
 
 KERNEL_FUNS = ("ns_init", "ns_step")
+EXPORTED_FUNS = ("ns_init_exported", "ns_step_exported")   # jitted wrappers of the loaded export
+# Traced only when exporting; a process that loads the export must trace none of these.
+TRACED_FUNS = KERNEL_FUNS + ("ns_init_flat", "ns_step_flat")
 STAGES = ("trace", "lower", "compile", "cache_hit")
 _PATTERNS = [
     ("trace", re.compile(r"^Finished tracing \+ transforming (?:jit[_(])?([\w.<>-]+)\)? for pjit in ([\d.e-]+) sec")),
@@ -74,8 +93,9 @@ class CompileLog(logging.Handler):
     any other JAX warning is passed through to stderr.
     """
 
-    def __init__(self):
+    def __init__(self, echo=KERNEL_FUNS):
         super().__init__(logging.DEBUG)
+        self.echo = set(echo)
         self.counts = defaultdict(int)       # (fun, stage) -> n
         self.seconds = defaultdict(float)    # (fun, stage) -> total s
 
@@ -88,7 +108,7 @@ class CompileLog(logging.Handler):
                 self.counts[fun, stage] += 1
                 if m.group(2):
                     self.seconds[fun, stage] += float(m.group(2))
-                if fun in KERNEL_FUNS:
+                if fun in self.echo:
                     if stage == "not_written":       # JAX's reason is the point of this record
                         print(f"    [jax] {stage:9s} {msg}")
                     else:
@@ -158,20 +178,26 @@ def main():
                          "'hit' = loaded from --cache-dir")
     ap.add_argument("--summary-out", help="write per-event ln Z, counts and posterior hash to this JSON")
     ap.add_argument("--compare-to", help="earlier --summary-out JSON; results must match it exactly")
+    ap.add_argument("--export-out", help="after sampling, export init/step to this new directory (T5)")
+    ap.add_argument("--load-export", help="load init/step from this export instead of tracing them (T5)")
+    ap.add_argument("--git-hash", help="recorded in the export manifest (informational)")
     args = ap.parse_args()
+    if args.export_out and args.load_export:
+        ap.error("--export-out and --load-export are exclusive")
     if args.expect_cache and not args.cache_dir:
         ap.error("--expect-cache needs --cache-dir")
     if args.expect_cache and args.no_log_compiles:
         ap.error("--expect-cache needs the jax_log_compiles records; drop --no-log-compiles")
 
     cache_dir = enable_persistent_cache(args.cache_dir) if args.cache_dir else None
-    test = "T4" if args.expect_cache else "T2"
+    test = "T5" if (args.export_out or args.load_export) else "T4" if args.expect_cache else "T2"
+    kernel_funs = EXPORTED_FUNS if args.load_export else KERNEL_FUNS
 
     intrinsic_only = not args.all_params
     log = None
     if not args.no_log_compiles:
         jax.config.update("jax_log_compiles", True)
-        log = CompileLog()
+        log = CompileLog(echo=TRACED_FUNS + EXPORTED_FUNS)
         jax_logger = logging.getLogger("jax")
         jax_logger.addHandler(log)
         jax_logger.setLevel(logging.WARNING)
@@ -203,7 +229,7 @@ def main():
     if cache_dir is not None:
         n_entries = sum(1 for p in cache_dir.iterdir() if p.is_file())
         print(f"persistent cache: {cache_dir} ({n_entries} files at start), expect {args.expect_cache or '-'}")
-        if args.expect_cache == "miss" and n_entries:
+        if args.expect_cache == "miss" and n_entries and not args.load_export:
             print("  WARN: cache dir is not empty; ns_init/ns_step may hit instead of miss")
 
     init = step = rebuild = sig0 = None
@@ -230,7 +256,18 @@ def main():
             if intrinsic_only and rebuild != {(0, 1, 2, 3): True}:
                 print("  FAIL: unexpected rebuild map for the intrinsic-only block")
                 ok = False
-            init, step = make_sampler(model, settings, rebuild)
+            if args.load_export:
+                t0 = time.perf_counter()
+                try:
+                    init, step = load_sampler(args.load_export, model, settings, rebuild, ev)
+                except ExportMismatch as e:
+                    print(f"  FAIL: {e}")
+                    raise SystemExit(1)
+                info = init.manifest["info"]
+                print(f"  loaded export {args.load_export} in {time.perf_counter() - t0:.2f} s "
+                      f"(made {info['created']} on {info['host']}, git {info['git_hash']})")
+            else:
+                init, step = make_sampler(model, settings, rebuild)
             sig0 = signature(ev)
         else:
             # rebuild map is event-independent; check it rather than trust it
@@ -248,8 +285,8 @@ def main():
         t_run = time.perf_counter() - t0
         after = log.snapshot() if log else {}
         new = {k: after.get(k, 0) - before.get(k, 0) for k in after if after.get(k, 0) != before.get(k, 0)}
-        kernel_new = {f"{f}.{s}": n for (f, s), n in new.items() if f in KERNEL_FUNS}
-        other_new = sum(n for (f, s), n in new.items() if f not in KERNEL_FUNS and s == "compile")
+        kernel_new = {f"{f}.{s}": n for (f, s), n in new.items() if f in kernel_funs}
+        other_new = sum(n for (f, s), n in new.items() if f not in kernel_funs and s == "compile")
 
         finite = np.isfinite(res["log_Z"]) and np.isfinite(res["log_Z_error"])
         ok &= bool(finite)
@@ -262,6 +299,7 @@ def main():
             print(f"  new kernel trace/lower/compile records: {kernel_new or 'none'}; "
                   f"other XLA compiles this event: {other_new}")
         results.append((eid, res, t_setup, t_run))
+        last_ev, last_positions = ev, positions
 
     print("\n=== summary")
     print(f"  {'event':>5} {'setup s':>8} {'wall s':>8} {'init s':>7} {'1st step s':>10} "
@@ -272,8 +310,8 @@ def main():
               f"{per_iter:12.3f} {res['n_iterations']:6d} {res['log_Z']:9.3f} {res['log_Z_error']:6.3f}")
 
     print("\n=== compile counts over all events (each must be 1)")
-    for name, fn in zip(KERNEL_FUNS, (init, step)):
-        n_cache = fn._cache_size()
+    for name, fn in zip(kernel_funs, (init, step)):
+        n_cache = getattr(fn, "jitted", fn)._cache_size()
         line = f"  {name}: jit cache size {n_cache}"
         ok &= n_cache == 1
         if log:
@@ -284,30 +322,53 @@ def main():
                 line += f", {stage} {n} ({log.seconds.get((name, stage), 0.0):.1f} s)"
         print(line)
     if log:
-        n_other = sum(n for (f, s), n in log.counts.items() if f not in KERNEL_FUNS and s == "compile")
+        n_other = sum(n for (f, s), n in log.counts.items() if f not in kernel_funs and s == "compile")
         print(f"  other XLA compiles (eager ops, finalise, prior draws; informational): {n_other}")
+        if args.load_export:
+            traced = {f: log.counts.get((f, "trace"), 0) for f in TRACED_FUNS}
+            bad = any(traced.values())
+            ok &= not bad
+            print(f"  traces of the exported functions (must all be 0): {traced}" + ("  FAIL" if bad else ""))
 
     if cache_dir is not None and log:
         want = {"miss": {"cache_hit": 0, "cache_miss": 1, "not_written": 0},
                 "hit": {"cache_hit": 1, "cache_miss": 0, "not_written": 0}}.get(args.expect_cache)
         print(f"\n=== persistent cache records (expect {args.expect_cache or '-'})")
-        for name in KERNEL_FUNS:
+        for name in kernel_funs:
             got = {s: log.counts.get((name, s), 0) for s in ("cache_hit", "cache_miss", "not_written")}
             bad = want is not None and got != want
             ok &= not bad
             print(f"  {name}: hit {got['cache_hit']}, miss {got['cache_miss']}, not written "
                   f"{got['not_written']}" + (f"  FAIL: expected {want}" if bad else ""))
-        hits = sum(n for (f, s), n in log.counts.items() if f not in KERNEL_FUNS and s == "cache_hit")
-        misses = sum(n for (f, s), n in log.counts.items() if f not in KERNEL_FUNS and s == "cache_miss")
+        hits = sum(n for (f, s), n in log.counts.items() if f not in kernel_funs and s == "cache_hit")
+        misses = sum(n for (f, s), n in log.counts.items() if f not in kernel_funs and s == "cache_miss")
         print(f"  other functions (informational): {hits} hits, {misses} misses")
         n_entries = sum(1 for p in cache_dir.iterdir() if p.is_file())
         print(f"  {cache_dir}: {n_entries} files at end")
+
+    if args.export_out:
+        print(f"\n=== export to {args.export_out}")
+        before = log.snapshot() if log else {}
+        try:
+            t = export_sampler(args.export_out, init, step, model, settings, rebuild, last_ev,
+                               jnp.asarray(last_positions), git_hash=args.git_hash)
+            print(f"  exported in {t['t_export_init']:.1f} s (init) + {t['t_export_step']:.1f} s (step), "
+                  f"{t['bytes'] / 1e6:.1f} MB")
+        except Exception as e:      # report and fail the test, but still write the summary below
+            print(f"  FAIL: {type(e).__name__}: {e}")
+            ok = False
+        if log:
+            after = log.snapshot()
+            new = {f"{f}.{s}": after[f, s] - before.get((f, s), 0) for f, s in after
+                   if f in TRACED_FUNS and after[f, s] != before.get((f, s), 0)}
+            print(f"  trace/lower records during export (informational): {new or 'none'}")
 
     summary = {str(eid): event_summary(res) for eid, res, _, _ in results}
     if args.summary_out:
         with open(args.summary_out, "w") as f:
             json.dump({"events": summary, "settings": repr(settings), "n_bins": args.n_bins,
-                       "layout": layout, "jax": jax.__version__}, f, indent=1)
+                       "layout": layout, "jax": jax.__version__,
+                       "mode": "load-export" if args.load_export else "export" if args.export_out else "trace"}, f, indent=1)
         print(f"\nwrote {args.summary_out}")
     if args.compare_to:
         ok &= compare_summaries(summary, args.compare_to)

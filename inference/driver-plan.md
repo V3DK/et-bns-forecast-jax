@@ -113,9 +113,11 @@ Both layers below work only after 2.1–2.3, once the compiled program no longer
 - Serialise `jax.export.export(step)(key_spec, state_spec, ev_spec)` and the same for `init` to files.
   - Loading skips tracing and lowering.
   - `exported.call(...)` still compiles, and that compile hits the cache from 3a, so a process starts in seconds.
-- At the export boundary, pass the key as raw `jax.random.key_data`, and flatten the state into its arrays (unflatten outside, with a treedef from `jax.eval_shape`). This avoids `register_namedtuple_serialization` for blackjax's state types.
+- At the export boundary, pass the key as raw `jax.random.key_data`, and flatten `EventData`, the state and `info` into their arrays. This avoids `register_namedtuple_serialization` for blackjax's state types. The treedefs are **pickled** with the artifact (`jax.eval_shape` would trace `ns_step`, which is what loading must avoid).
 - Export on the target platform, i.e. on the CSD3 GPU node in the warm job.
-- **Manifest** stored with the artifact: jax/jaxlib/jimgw/blackjax versions, `pixi.lock` hash, git hash, n_live, `N_BINS`, steps per dimension, delete fraction, blocks, `INTRINSIC_ONLY`, waveform, GPU type (`jax.devices()[0].device_kind`). Load the artifact only if the manifest matches; otherwise trace normally and log a warning.
+- **Manifest** stored with the artifact: jax/jaxlib/jimgw/blackjax/ripplegw versions, `pixi.lock` hash, a hash of the program's sources (`kernel.py`, `event_model.py`), n_live, `N_BINS` and the `EventData` signature, steps per dimension, delete fraction, blocks, `INTRINSIC_ONLY`, waveform, x64, PRNG implementation, backend, `device_kind` and CPU architecture. Load the artifact only if all of these match; otherwise trace normally and log a warning. The git hash is recorded but not matched (passed in with `--git-hash`, so the code never calls git).
+- Needs `python-flatbuffers` in the environment.
+- Implemented in `export_kernel.py`; T5 runs through `check_kernel.py --export-out / --load-export`.
 
 ### Priority
 With one long-lived process per GPU, compile is paid once per task. For example, 250 events × ~1 min ≈ 4 h per task, so a ~200 s compile is under 2%. The driver plus 3a gets most of the gain. 3b matters when tasks are short (time limits, preemption, many small array tasks).

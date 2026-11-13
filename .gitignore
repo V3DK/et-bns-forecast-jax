@@ -3,3 +3,8 @@
 __pycache__/
 /logs/
 /runs/
+
+# JAX persistent compilation caches (T4 and later)
+jax_cache*/
+# jax.export artifacts (T5 and later; export_kernel.py)
+export_*/
